@@ -449,11 +449,15 @@ class Worker:
         self._send([completed.message], self.config.completed_flush_timeout_s, COMPLETED, address)
 
     def _send_dlq(self, message: InboundMessage, error_class: str, address: Address | None) -> None:
-        """Best effort: the DLQ is diagnostics only; one attempt, then log and move on."""
-        dlq = dlq_message(message, topic=self.config.build_dlq_topic, error_class=error_class)
+        """Best effort: the DLQ is diagnostics only; one attempt, then log and move on.
+
+        Any failure, including one while building the copy, is logged so the offset is still
+        committed: otherwise one bad message would crash-loop the worker.
+        """
         try:
+            dlq = dlq_message(message, topic=self.config.build_dlq_topic, error_class=error_class)
             self.producer.send([dlq], self._flush_timeout(self.config.started_flush_timeout_s))
-        except TransientKafkaError as exc:
+        except Exception as exc:  # noqa: BLE001 -- best effort; class only, never the payload
             jsonlog.log(
                 ERROR,
                 "dlq.failed",

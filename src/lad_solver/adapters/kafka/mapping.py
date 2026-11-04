@@ -132,6 +132,15 @@ def _load(raw: bytes | None) -> dict[str, object] | Poison:
 _SCHEMA_VERSION: Final = re.compile(SCHEMA_VERSION_PATTERN)
 
 
+def _is_utf8(text: str) -> bool:
+    """False for lone surrogates: json.loads accepts "\\ud800", but it cannot be encoded back."""
+    try:
+        text.encode()
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
 def _address(document: dict[str, object]) -> Address | None:
     """``school_id`` + ``data.job_id``; a missing or invalid correlation_id falls back to the job id
     (the outbound envelope requires a non-empty one, and the job id still links the logs)."""
@@ -140,7 +149,11 @@ def _address(document: dict[str, object]) -> Address | None:
     except ValidationError:
         return None
     correlation = document.get("correlation_id")
-    if not (isinstance(correlation, str) and 1 <= len(correlation) <= MAX_CORRELATION_ID):
+    if not (
+        isinstance(correlation, str)
+        and 1 <= len(correlation) <= MAX_CORRELATION_ID
+        and _is_utf8(correlation)
+    ):
         correlation = str(head.data.job_id)
     return Address(head.data.job_id, head.school_id, correlation)
 
@@ -186,12 +199,15 @@ def parse_build_request(raw: bytes | None) -> ParseOutcome:
         try:
             event = BuildRequested.model_validate(document)
             problem = to_problem(event.data)
+            digest = input_sha256(event.data)  # encodes every validated string
         except ValidationError:
             rejection = (ErrorCode.INVALID_PAYLOAD, "validation")
         except InvalidInputError:
             rejection = (ErrorCode.INVALID_PAYLOAD, "referential_integrity")
+        except UnicodeEncodeError:
+            rejection = (ErrorCode.INVALID_PAYLOAD, "invalid_unicode")
         else:
-            return Accepted(address, event.data, problem, input_sha256(event.data), event.time)
+            return Accepted(address, event.data, problem, digest, event.time)
     return Rejected(address, *rejection)
 
 
@@ -441,11 +457,19 @@ def _is_plain(item: object) -> bool:
     return False
 
 
-def _project(value: object, models: list[type[BaseModel]]) -> object:
-    """Keep only fields the contract knows; anything else (e.g. a signature) is dropped."""
+MAX_DLQ_DEPTH: Final = 16  # the contract nests at most 4 levels; deeper input is redacted
+
+
+def _project(value: object, models: list[type[BaseModel]], depth: int = 0) -> object:
+    """Keep only fields the contract knows; anything else (e.g. a signature) is dropped.
+
+    Depth is bounded: json.loads accepts ~10^5 levels, far beyond the recursion limit.
+    """
+    if depth >= MAX_DLQ_DEPTH:
+        return "<redacted:too_deep>"
     if isinstance(value, list):
         items: list[object] = value  # pyright: ignore[reportUnknownVariableType]
-        return [_project(item, models) for item in items]
+        return [_project(item, models, depth + 1) for item in items]
     if not isinstance(value, dict):
         return _redacted(value)
     document: dict[str, object] = value  # pyright: ignore[reportUnknownVariableType]
@@ -457,7 +481,7 @@ def _project(value: object, models: list[type[BaseModel]]) -> object:
             item = document[name]
             nested = list(_models_in(info.annotation))
             if nested:
-                projected[name] = _project(item, nested)
+                projected[name] = _project(item, nested, depth + 1)
             else:
                 projected[name] = item if _is_plain(item) else _redacted(item)
     return projected
@@ -472,7 +496,9 @@ def dlq_value(raw: bytes | None) -> bytes | None:
         document: object = json.loads(raw)
     except ValueError, RecursionError:
         return raw
-    return _encode({"projected": _project(document, [BuildRequested])})
+    # ASCII escapes: a lone surrogate from the input must not break the diagnostic copy.
+    projected = {"projected": _project(document, [BuildRequested])}
+    return json.dumps(projected, ensure_ascii=True, separators=(",", ":")).encode()
 
 
 def dlq_message(message: InboundMessage, *, topic: str, error_class: str) -> OutboundMessage:

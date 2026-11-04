@@ -378,3 +378,85 @@ def test_queue_deadline_is_compared_as_an_instant(
     status = h.producer.of_type("solve.completed")[0]["data"]["status"]
     assert (status == "EXPIRED") is expired
     assert (h.engine.calls == []) is expired
+
+
+# ---------------------------------------------------------------- 9. poison that breaks encoding
+
+
+def _ascii(document: Json) -> bytes:
+    """Lone surrogates survive only as JSON escapes; json.loads turns them into code points."""
+    return json.dumps(document, ensure_ascii=True).encode()
+
+
+@pytest.mark.parametrize("depth", [2_000, 50_000])
+def test_deeply_nested_poison_is_dlq_copied_and_committed(depth: int) -> None:
+    h = harness()
+
+    assert h.run(b"[" * depth + b"]" * depth, b"not json") == 0
+
+    assert h.consumer.committed == [7, 8]  # no crash loop on one offset
+    assert len(h.producer.dlq()) == 2
+
+
+def test_deeply_nested_unknown_field_of_an_addressed_job_is_ignored() -> None:
+    h = harness()
+    head, tail = encode(build_request()).rsplit(b"}", 1)
+    raw = head + b',"extra":' + b"[" * 50_000 + b"]" * 50_000 + b"}" + tail
+
+    assert h.run(raw) == 0
+
+    assert h.producer.of_type("solve.completed")[0]["data"]["status"] == "FEASIBLE"
+    assert h.consumer.committed == [7]
+
+
+def test_lone_surrogate_in_correlation_id_is_rejected_under_the_job_id() -> None:
+    h = harness()
+    document = build_request()
+    document["correlation_id"] = "req-\ud800"
+
+    assert h.run(_ascii(document)) == 0
+
+    completed = h.producer.of_type("solve.completed")[0]
+    assert completed["data"]["status"] == "MODEL_INVALID"
+    assert completed["data"]["error"] == {"code": "invalid_payload"}
+    assert completed["correlation_id"] == JOB_ID  # the echo cannot break the reply
+    assert h.engine.calls == []
+    assert h.consumer.committed == [7]
+
+
+def test_lone_surrogate_in_payload_is_rejected_not_crashed() -> None:
+    h = harness()
+    document = with_data(build_request(), lambda d: d["classes"][0].update(id="c-\ud800"))
+
+    assert h.run(_ascii(document)) == 0
+
+    data = h.producer.of_type("solve.completed")[0]["data"]
+    assert data["status"] == "MODEL_INVALID"
+    assert data["error"] == {"code": "invalid_payload"}
+    assert h.engine.calls == []
+    assert h.consumer.committed == [7]
+    json.loads(h.producer.dlq()[0].value or b"")  # the DLQ copy is still valid JSON
+
+
+def test_lone_surrogate_in_poison_still_gets_a_dlq_copy() -> None:
+    h = harness()
+
+    assert h.run(_ascii({"school_id": "\ud800"})) == 0
+
+    assert h.consumer.committed == [7]
+    assert len(h.producer.dlq()) == 1
+
+
+def test_any_failure_building_the_dlq_copy_is_logged_and_committed(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def broken(*_: object, **__: object) -> object:
+        raise MemoryError
+
+    monkeypatch.setattr("lad_solver.adapters.kafka.worker.dlq_message", broken)
+    h = harness()
+
+    assert h.run(b"not json") == 0
+
+    assert h.consumer.committed == [7]
+    assert len(_events(capsys.readouterr().out, "dlq.failed")) == 1
