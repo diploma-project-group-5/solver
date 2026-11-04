@@ -1,0 +1,105 @@
+[project]
+name = "lad-solver"
+version = "0.1.0"
+description = "Lad timetable solver: CP-SAT worker for main/alert timetables and substitutions, plus the bench CLI."
+authors = [{ name = "Roman Osovyk", email = "r.osovyk@gmail.com" }]
+readme = "README.md"
+license = "LicenseRef-Proprietary"  # team decides the licence; until then not for distribution
+classifiers = ["Private :: Do Not Upload"]
+requires-python = ">=3.14,<3.15"
+dependencies = [
+    # CP-SAT. Minor releases may change solver behaviour, so stay within one minor and bump deliberately.
+    "ortools>=9.15,<9.16",
+]
+
+[project.scripts]
+lad-solver = "lad_solver.__main__:main"
+
+[project.optional-dependencies]
+worker = [
+    # Exact pin: librdkafka behaviour (rebalance, idempotence) is part of the worker contract (ADR 2026-11-04 §4).
+    "confluent-kafka==2.16.1",
+    "pydantic>=2.12",
+]
+
+[dependency-groups]
+dev = [
+    # The worker extra is needed to run and type-check the Kafka adapter tests locally.
+    "lad-solver[worker]",
+    "hypothesis>=6.170",
+    "jsonschema>=4.25",
+    "pyright>=1.1.414",
+    "pytest>=9.2",
+    "pytest-cov>=7.1",
+    "ruff>=0.17.3",
+    "testcontainers[kafka]>=4.15.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.13.7,<0.14.0"]
+build-backend = "uv_build"
+
+# ---------------------------------------------------------------- ruff
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+    "D",       # docstrings: required only where intent is not obvious (reviewed manually)
+    "CPY001",  # no copyright headers
+    "COM812",  # conflicts with the formatter
+    "FIX",     # TODOs are allowed while they reference an issue
+    "TD002",   # TODO author not required (git blame)
+    "TC",      # runtime imports of types are needed by pydantic/dataclasses; import cost is negligible
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = [
+    "S101",    # assert is the point of a test
+    "PLR2004", # magic values are fine in expectations
+    "INP001",  # tests are not a package
+]
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "all"
+
+[tool.ruff.format]
+docstring-code-format = true
+
+# ---------------------------------------------------------------- pyright
+[tool.pyright]
+pythonVersion = "3.14"
+typeCheckingMode = "strict"
+include = ["src", "tests"]
+venvPath = "."
+venv = ".venv"
+reportMissingTypeStubs = false   # ortools ships partial stubs
+extraPaths = ["tests/adapters", "tests"]  # pytest pythonpath + tests/conftest.py helpers
+reportUnnecessaryTypeIgnoreComment = "error"
+
+# ---------------------------------------------------------------- pytest
+[tool.pytest.ini_options]
+minversion = "9.0"
+testpaths = ["tests"]
+addopts = ["-ra", "--strict-markers", "--strict-config", "--import-mode=importlib"]
+# Shared fakes/builders of the Kafka adapter tests (tests/adapters/kafka_support.py).
+pythonpath = ["tests/adapters"]
+xfail_strict = true
+filterwarnings = ["error"]
+markers = [
+    "integration: needs Docker (Kafka/testcontainers); excluded from the default fast run",
+    "slow: long-running test (seconds or more); deselect with -m 'not slow'",
+]
+
+# ---------------------------------------------------------------- coverage
+[tool.coverage.run]
+source = ["lad_solver"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+exclude_also = ["if TYPE_CHECKING:", "raise NotImplementedError"]

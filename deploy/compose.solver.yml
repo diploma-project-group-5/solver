@@ -1,0 +1,61 @@
+# Compose fragment for the platform owner (ADR 2026-11-04-solver-kafka-mvp §4, §6).
+# Merge into platform/docker-compose.yml; the solver repo does not own the stack.
+#
+# Requested broker settings (single-node KRaft):
+#   offsets.topic.replication.factor=1      (KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1)
+#   transaction.state.log.replication.factor=1, transaction.state.log.min.isr=1
+#   group.initial.rebalance.delay.ms=0      (KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS=0)
+#   auto.create.topics.enable=false         (topics come from kafka-init)
+#   message.max.bytes: default (1 MB); the solver caps solve.completed at 900 KB
+#
+# Topics for kafka-init (retention: 7 days, DLQ 14 days; key = school_id):
+#   solve.build.requested            timetable -> solver
+#   solve.build.requested.dlq        solver diagnostics only, never replayed (retention.ms=1209600000)
+#   solve.status                     solver -> timetable (solve.started, solve.completed)
+#   solve.substitution.requested     stage 2; the solver does not subscribe to it yet
+#   solve.substitution.requested.dlq stage 2
+#
+# timetable side (not here): default time limit 60 s (build) / 15 s (substitution);
+# run_deadline_at = started_at + limit + >= 90 s; queue_deadline_at >= creation + 10 min.
+
+services:
+  solver:
+    image: ghcr.io/diploma-project-group-5/solver:${SOLVER_TAG:?set an exact image tag}
+    command: ["worker"]
+    init: true                    # SIGTERM reaches the worker; zombies are reaped
+    restart: unless-stopped       # exit 1 (fatal Kafka error, watchdog) -> restart
+    stop_grace_period: 30s        # SIGTERM -> stop CP-SAT -> publish best solution -> exit 0
+    cpus: 4                       # = SOLVER_NUM_WORKERS; keeps the API on the same VM responsive
+    # Measured peak RSS of the whole solver process: 222 MB (45-class school, 4 CP-SAT workers).
+    # CP-SAT is capped at SOLVER_MAX_MEMORY_MB (~0.7 x mem_limit) and returns its best solution.
+    mem_limit: 768m
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      SOLVER_GROUP_ID: lad-solver
+      SOLVER_BUILD_TOPIC: solve.build.requested
+      SOLVER_STATUS_TOPIC: solve.status
+      SOLVER_BUILD_DLQ_TOPIC: solve.build.requested.dlq
+      SOLVER_MIN_TIME_LIMIT_S: "10"
+      SOLVER_MAX_TIME_LIMIT_S: "180"
+      SOLVER_NUM_WORKERS: "4"
+      SOLVER_SEED: "0"
+      SOLVER_STOP_GRACE_S: "20"   # < stop_grace_period, leaves time to publish and close
+      SOLVER_STOP_FLUSH_TIMEOUT_S: "4"  # once stopping: completed flush + close flush, 4 s each
+      SOLVER_SHUTDOWN_BUDGET_S: "29"    # grace + 2 x flush + 1 s must fit; < stop_grace_period
+      SOLVER_MAX_MEMORY_MB: "512"
+      SOLVER_WATCHDOG_MARGIN_S: "60"
+      SOLVER_HEARTBEAT_FILE: /tmp/lad-solver.alive
+      KAFKA_MAX_POLL_INTERVAL_MS: "300000"   # must exceed (max limit + watchdog margin) * 1000
+      KAFKA_SESSION_TIMEOUT_MS: "10000"
+      KAFKA_HEARTBEAT_INTERVAL_MS: "3000"
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    # No ports: the worker has no HTTP endpoint; health is the image HEALTHCHECK (heartbeat file).

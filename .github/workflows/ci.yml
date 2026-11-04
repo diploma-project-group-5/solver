@@ -1,0 +1,97 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main, develop]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0  # gitleaks scans the history
+
+      - uses: astral-sh/setup-uv@v10
+        with:
+          version: "0.13.7"
+          enable-cache: true
+
+      - name: Install (locked)
+        run: uv sync --locked
+
+      - name: Format
+        run: uv run ruff format --check .
+
+      - name: Lint
+        run: uv run ruff check --output-format=github .
+
+      - name: Type check
+        run: uv run pyright
+
+      # Contract conformance (schemas, topic manifest, job-lifecycle vectors) runs against a pinned
+      # contracts commit. Bump CONTRACTS_REF together with any change to the solver's events.
+      # Currently: contracts PR #1 (feat/23-solve-event-contracts); move to the merge commit once merged.
+      - name: Check out contracts
+        uses: actions/checkout@v7
+        with:
+          repository: diploma-project-group-5/contracts
+          ref: 45248891bc3cdefcfb370bc28983bcfda69525c4
+          path: _contracts
+
+      - name: Unit and contract tests
+        env:
+          LAD_CONTRACTS_DIR: ${{ github.workspace }}/_contracts
+        run: uv run pytest -m "not integration" --cov --cov-report=term-missing
+
+      - name: Dependency audit
+        run: uv export --locked --no-dev --no-hashes --no-emit-project --format requirements-txt | uvx pip-audit --strict -r /dev/stdin
+
+      - name: Secret scan
+        run: |
+          docker run --rm -v "$PWD:/repo" ghcr.io/gitleaks/gitleaks:v8.30.1 \
+            git /repo --redact --no-banner --exit-code 1
+
+  integration:
+    needs: checks
+    runs-on: ubuntu-24.04  # Docker is available for testcontainers (apache/kafka, KRaft)
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v10
+        with:
+          version: "0.13.7"
+          enable-cache: true
+
+      - name: Install (locked)
+        run: uv sync --locked
+
+      - name: Integration tests (Kafka in testcontainers)
+        run: uv run pytest -m integration
+
+  image:
+    needs: checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build image
+        run: docker build --tag lad-solver:${{ github.sha }} .
+      # The default command is the Kafka worker, which needs a broker; smoke-test the CLI instead.
+      - name: Smoke-run image
+        run: |
+          docker run --rm lad-solver:${{ github.sha }} --help
+          docker run --rm --entrypoint sh lad-solver:${{ github.sha }} -c \
+            'lad-solver generate --classes 3 --shelter-ratio 0.5 --out /tmp/p.json &&
+             lad-solver solve --in /tmp/p.json --out /tmp/r.json --time-limit 5 --workers 1'
+
