@@ -22,7 +22,7 @@ def _base(**overrides: object) -> Problem:
         staff=5,
         capacity=Passport(100),
     )
-    return replace(base, **overrides)  # pyright: ignore[reportArgumentType]
+    return replace(base, **overrides)
 
 
 def test_valid_problem_has_no_conflicts() -> None:

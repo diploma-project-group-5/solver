@@ -119,7 +119,7 @@ def topics(bootstrap: str) -> Topics:
         ]
     )
     for future in futures.values():  # pyright: ignore[reportUnknownVariableType]
-        future.result(timeout=30)  # pyright: ignore[reportUnknownMemberType]
+        future.result(timeout=30)
     return names
 
 

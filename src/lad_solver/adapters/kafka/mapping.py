@@ -414,7 +414,7 @@ def completed_message(
     value = _envelope(address, COMPLETED, data, now)
     status = str(data["status"])
     error = data.get("error")
-    code = ErrorCode(error["code"]) if isinstance(error, dict) else None  # pyright: ignore[reportUnknownArgumentType]
+    code = ErrorCode(error["code"]) if isinstance(error, dict) else None
     if len(value) > max_bytes:
         too_large = rejected_data(address.job_id, ErrorCode.RESULT_TOO_LARGE)
         too_large["conflicts"] = []
