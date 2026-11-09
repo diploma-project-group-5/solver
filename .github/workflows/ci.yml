@@ -42,12 +42,11 @@ jobs:
 
       # Contract conformance (schemas, topic manifest, job-lifecycle vectors) runs against a pinned
       # contracts commit. Bump CONTRACTS_REF together with any change to the solver's events.
-      # Currently: contracts PR #1 head (feat/23-solve-event-contracts, 21a5457); move to the merge commit once merged.
       - name: Check out contracts
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7, resolved 2026-11-08
         with:
           repository: diploma-project-group-5/contracts
-          ref: 21a54578f92144d660a22553cfa45c7b0684dd00
+          ref: v0.2.0  # tag on the merge commit 4e4759a
           path: _contracts
           persist-credentials: false
 
