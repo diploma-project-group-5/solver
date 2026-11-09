@@ -16,11 +16,12 @@ from lad_solver.adapters.kafka.worker import EXIT_FAILURE, Worker
 from lad_solver.app.solve import solve
 from lad_solver.domain.problem import Params, Problem
 from lad_solver.domain.result import Result
+from lad_solver.model.progress import Progress
 from lad_solver.model.stop import StopHandle
 
 
-def _engine(problem: Problem, params: Params, stop: StopHandle) -> Result:
-    return solve(problem, params, stop)
+def _engine(problem: Problem, params: Params, stop: StopHandle, progress: Progress) -> Result:
+    return solve(problem, params, stop, progress=progress)
 
 
 def touch(path: Path) -> None:
@@ -66,8 +67,14 @@ def run(env: Mapping[str, str] | None = None) -> int:
         INFO,
         "worker.ready",
         topic=config.build_topic,
+        group_id=config.group_id,
         solver_version=__version__,
         model_version=MODEL_VERSION,
+        num_workers=config.num_workers,
+        time_limit_s=[config.min_time_limit_s, config.max_time_limit_s],
+        max_memory_mb=config.max_memory_mb,
+        stall_min_s=config.stall_min_s or None,  # None: the no-improvement stop is off
+        stall_ratio=config.stall_ratio,
     )
     code = worker.run()
     jsonlog.log(INFO, "worker.exited", status=code)

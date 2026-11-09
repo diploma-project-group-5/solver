@@ -228,7 +228,7 @@ def test_config_defaults_match_the_adr() -> None:
 
     assert loaded.group_id == "lad-solver"
     assert (loaded.min_time_limit_s, loaded.max_time_limit_s) == (10, 180)
-    assert (loaded.num_workers, loaded.seed) == (4, 0)
+    assert (loaded.num_workers, loaded.seed) == (2, 0)
     assert loaded.max_poll_interval_ms == 300_000
     assert loaded.build_dlq_topic == "solve.build.requested.dlq"
     assert loaded.completed_flush_timeout_s == 35
@@ -369,3 +369,115 @@ def test_max_memory_defaults_to_512_mb_and_reaches_params() -> None:
 def test_shutdown_budget_must_fit_the_stop_grace_period() -> None:
     with pytest.raises(ConfigError):
         WorkerConfig.from_env({"KAFKA_BOOTSTRAP_SERVERS": "k:9092", "SOLVER_STOP_GRACE_S": "28"})
+
+
+def test_stall_settings_come_from_env_and_zero_means_off() -> None:
+    off = WorkerConfig.from_env({"KAFKA_BOOTSTRAP_SERVERS": "kafka:9092"})
+    on = WorkerConfig.from_env(
+        {
+            "KAFKA_BOOTSTRAP_SERVERS": "kafka:9092",
+            "SOLVER_STALL_MIN_S": "8",
+            "SOLVER_STALL_RATIO": "1.0",
+        }
+    )
+    data = _accepted(build_request()).data
+    common = {"min_time_limit_s": 10, "max_time_limit_s": 180, "num_workers": 2, "seed": 0}
+
+    assert (off.stall_min_s, off.stall_ratio) == (0.0, 1.0)
+    assert params_for(data, **common, stall_min_s=off.stall_min_s).stall_min_s is None
+    params = params_for(data, **common, stall_min_s=on.stall_min_s, stall_ratio=on.stall_ratio)
+    assert (params.stall_min_s, params.stall_ratio) == (8.0, 1.0)
+
+
+@pytest.mark.parametrize(
+    "env",
+    [{"SOLVER_STALL_MIN_S": "-1"}, {"SOLVER_STALL_RATIO": "0"}, {"SOLVER_STALL_MIN_S": "nan"}],
+)
+def test_invalid_stall_settings_fail_fast(env: dict[str, str]) -> None:
+    with pytest.raises(ConfigError, match="SOLVER_STALL"):
+        WorkerConfig.from_env({"KAFKA_BOOTSTRAP_SERVERS": "kafka:9092", **env})
+
+
+# ---------------------------------------------------------------- audit: hostile numbers, DLQ size
+
+
+def test_huge_schema_major_is_unsupported_not_a_parser_bug() -> None:
+    document = build_request()
+    document["schema_version"] = "9" * 5000 + ".0"  # int() would refuse it (> 4300 digits)
+
+    outcome = parse_build_request(encode(document))
+
+    assert outcome == Rejected(ADDRESS, ErrorCode.UNSUPPORTED_SCHEMA_VERSION, "schema_version")
+
+
+@pytest.mark.parametrize(
+    "data_overrides",
+    [
+        {"capacity": {"passport": 2**63}},
+        {"kind": "alert", "model": "1.2", "capacity": {"seats": 2**63, "passport": 9}},
+        {"staff": 2**63},
+        {"snapshot_version": 2**63},
+    ],
+)
+def test_counts_beyond_int64_are_rejected(data_overrides: dict[str, object]) -> None:
+    outcome = parse_build_request(encode(build_request(**data_overrides)))
+
+    # an out-of-range alert capacity also fails the passport-only shape, hence "validation" or
+    # "referential_integrity": either way the job is answered as invalid_payload, not crashed
+    assert isinstance(outcome, Rejected)
+    assert outcome.code is ErrorCode.INVALID_PAYLOAD
+
+
+def test_int64_max_count_is_still_accepted() -> None:
+    document = with_data(build_request(), lambda d: d["capacity"].update(passport=2**63 - 1))
+
+    assert _accepted(document).problem.capacity == Passport(passport=2**63 - 1)
+
+
+MARKER = "Іваненко-MARKER-7f3a"
+
+
+def _huge_staff() -> bytes:
+    document = with_data(build_request(), lambda d: d["teachers"][0].update(signature=MARKER))
+    return encode(document).replace(b'"staff": 4', b'"staff": ' + b"7" * 5000)
+
+
+def test_integer_over_4300_digits_is_rejected_not_poison() -> None:
+    assert parse_build_request(_huge_staff()) == Rejected(
+        ADDRESS, ErrorCode.INVALID_PAYLOAD, "validation"
+    )
+
+
+def test_integer_over_4300_digits_is_projected_in_the_dlq() -> None:
+    copy = dlq_message(inbound(_huge_staff()), topic="dlq", error_class="validation")
+
+    value = copy.value or b""
+    assert MARKER.encode() not in value
+    assert json.dumps(MARKER).strip('"').encode() not in value
+    assert json.loads(value)["projected"]["data"]["staff"] == "<redacted:str>"
+
+
+def test_oversized_dlq_projection_falls_back_to_the_envelope_head() -> None:
+    document = with_data(build_request(), lambda d: d.update(classes=[1] * 300_000))
+
+    copy = dlq_message(inbound(encode(document)), topic="dlq", error_class="validation")
+
+    value = copy.value or b""
+    assert len(value) < 512 * 1024
+    loaded = json.loads(value)
+    assert loaded["truncated"] is True
+    assert loaded["projected"]["data"] == {"job_id": JOB_ID}
+    assert loaded["projected"]["school_id"] == SCHOOL_ID
+    assert loaded["projected"]["type"] == "solve.build.requested"
+
+
+@pytest.mark.parametrize("literal", [b"NaN", b"Infinity", b"-Infinity"])
+def test_non_finite_numbers_are_redacted_in_the_dlq(literal: bytes) -> None:
+    raw = encode(build_request()).replace(b'"staff": 4', b'"staff": ' + literal)
+    raw = raw.replace(b'"unavailable_days": [3]', b'"unavailable_days": [3, ' + literal + b"]")
+
+    copy = dlq_message(inbound(raw), topic="dlq", error_class="validation")
+
+    loaded = json.loads(copy.value or b"")  # strict JSON: no NaN / Infinity tokens left
+    assert loaded["projected"]["data"]["staff"] == "<redacted:float>"
+    assert loaded["projected"]["data"]["teachers"][1]["unavailable_days"] == "<redacted:list>"

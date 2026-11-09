@@ -1,5 +1,7 @@
 """Worker loop on fake ports: ordering, retries, rejections and shutdown (ADR 2026-11-04 §4)."""
 
+import hashlib
+import json
 import threading
 from uuid import UUID
 
@@ -88,7 +90,14 @@ def test_poison_message_goes_to_dlq_and_is_committed() -> None:
 
     assert h.journal.entries == ["send:dlq", "commit"]
     dlq = h.producer.dlq()[0]
-    assert dlq.value == raw
+    # Unparseable bytes never land in the DLQ as-is (they may hold personal data, kept 14 days):
+    # only size and hash, enough to match the message with the producer's own logs.
+    assert dlq.value is not None
+    assert json.loads(dlq.value) == {
+        "unparseable": True,
+        "size_bytes": len(raw),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+    }
     assert dict(dlq.headers) == {
         "x-error-class": b"not_json",
         "x-original-topic": b"solve.build.requested",
@@ -279,3 +288,14 @@ def test_messages_are_processed_one_at_a_time_in_order() -> None:
         JOB_ID,
         *[second["data"]["job_id"]] * 2,
     ]
+
+
+def test_unparseable_poison_with_personal_data_is_not_copied_to_the_dlq() -> None:
+    h = harness()
+    raw = '{"teachers": [{"signature": "Іваненко"'.encode()
+
+    h.run(raw)  # truncated JSON with a signature
+
+    value = h.producer.dlq()[0].value or b""
+    assert b"signature" not in value
+    assert "Іваненко".encode() not in value

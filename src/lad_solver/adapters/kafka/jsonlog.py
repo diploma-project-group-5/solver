@@ -19,10 +19,11 @@ ALLOWED_FIELDS: Final = frozenset(
         "job_id",
         "school_id",
         "correlation_id",
-        "event_type",
         "status",
         "error_code",
         "error_class",
+        # librdkafka error names (e.g. "_TRANSPORT") or fixed literals only, never payload text
+        "reason",
         "queue_wait_ms",
         "wall_time_ms",
         "time_limit_s",
@@ -41,6 +42,16 @@ ALLOWED_FIELDS: Final = frozenset(
         "where",
         "count",
         "phase_a_status",
+        # timings and search telemetry (ADR 2026-11-08): numbers only
+        "handle_ms",
+        "first_solution_ms",
+        "last_improvement_ms",
+        "gap",
+        "num_workers",
+        "stall_min_s",
+        "stall_ratio",
+        "max_memory_mb",
+        "group_id",
     }
 )
 

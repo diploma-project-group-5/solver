@@ -36,6 +36,7 @@ class StopReason(StrEnum):
     COMPLETED = "completed"  # search finished (optimal or infeasible proven)
     TIME_LIMIT = "time_limit"
     STOPPED = "stopped"  # external stop (SIGTERM)
+    NO_IMPROVEMENT = "no_improvement"  # phase A stopped: the objective stopped improving
     PRECHECK = "precheck"  # rejected before CP-SAT
 
 
@@ -74,6 +75,7 @@ class Stats:
     secondary: int | None = None
     wall_time_s: float = 0.0
     first_solution_s: float | None = None  # wall seconds from start to the first phase A solution
+    last_improvement_s: float | None = None  # wall seconds from start to the last improvement
     phase_a_status: str | None = None
     quality_relaxed: bool = False  # row-day cap was dropped to find a solution
     stop_reason: StopReason = StopReason.COMPLETED

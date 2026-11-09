@@ -57,6 +57,7 @@ from lad_solver.adapters.kafka.ports import (
 )
 from lad_solver.domain.problem import Params, Problem
 from lad_solver.domain.result import ConflictRule, Result, SolveStatus
+from lad_solver.model.progress import Progress
 from lad_solver.model.stop import StopHandle
 
 RETRY_DELAYS_S: Final = (1.0, 2.0, 4.0)
@@ -95,6 +96,7 @@ class Worker:
     _current: Address | None = field(default=None, init=False)  # job being handled
     _last: Address | None = field(default=None, init=False)  # last job handled
     _solving: Future[Result] | None = field(default=None, init=False)
+    _received_at: float = field(default=0.0, init=False)  # monotonic, when handle() began
 
     # ------------------------------------------------------------ lifecycle
 
@@ -166,6 +168,7 @@ class Worker:
                     "consumer.unhealthy",
                     attempt=self._consumer_errors,
                     error_class=type(exc).__name__,
+                    reason=_reason(exc),
                 )
             return None
         self._consumer_errors = 0
@@ -203,6 +206,7 @@ class Worker:
     # ------------------------------------------------------------ one message
 
     def handle(self, message: InboundMessage) -> None:
+        self._received_at = self.monotonic()
         try:
             outcome = parse_build_request(message.value)
         except Exception as exc:  # noqa: BLE001 -- a parser bug must not crash-loop on one message
@@ -250,6 +254,15 @@ class Worker:
         )
         self._send_dlq(message, error_class, None)
         self._commit(message, None)
+        jsonlog.log(
+            INFO,
+            "message.done",
+            topic=message.topic,
+            partition=message.partition,
+            offset=message.offset,
+            error_class=error_class,
+            handle_ms=self._handle_ms(),
+        )
 
     def _on_rejected(self, message: InboundMessage, outcome: Rejected) -> None:
         address = outcome.address
@@ -283,6 +296,8 @@ class Worker:
             num_workers=config.num_workers,
             seed=config.seed,
             max_memory_mb=config.max_memory_mb,
+            stall_min_s=config.stall_min_s,
+            stall_ratio=config.stall_ratio,
         )
         jsonlog.log(
             INFO,
@@ -290,6 +305,8 @@ class Worker:
             **_ids(address),
             queue_wait_ms=_ms_between(outcome, now),
             time_limit_s=params.time_limit_s,
+            num_workers=params.num_workers,
+            stall_min_s=params.stall_min_s,
         )
         began = self.monotonic()
         result, error_code = self._solve(address, outcome.problem, params)
@@ -304,16 +321,23 @@ class Worker:
             data = rejected_data(address.job_id, error_code)
         completed = self._completed(address, data)
         self._send_completed(completed, address)
+        if error_code is not None:  # the engine failed: there is no search telemetry to report
+            self._log_completed(address, completed, wall_time_ms=wall_time_ms)
+            return
         stats = result.stats
         self._log_completed(
             address,
             completed,
             wall_time_ms=wall_time_ms,
+            first_solution_ms=_ms(stats.first_solution_s),
+            last_improvement_ms=_ms(stats.last_improvement_s),
             objective=stats.objective,
             best_bound=stats.best_bound,
+            gap=_gap(stats.objective, stats.best_bound),
             stop_reason=stats.stop_reason.value,
             quality_relaxed=stats.quality_relaxed,
             phase_a_status=stats.phase_a_status,
+            num_workers=stats.num_workers,
         )
 
     @staticmethod
@@ -337,6 +361,7 @@ class Worker:
         self, address: Address, problem: Problem, params: Params
     ) -> tuple[Result, ErrorCode | None]:
         stop = StopHandle()
+        progress = Progress()
         if self._stop_requested:  # the signal arrived before the handle existed
             stop.stop()
         future: Future[Result] = Future()
@@ -345,7 +370,7 @@ class Worker:
             if not future.set_running_or_notify_cancel():
                 return
             try:
-                future.set_result(self.engine(problem, params, stop))
+                future.set_result(self.engine(problem, params, stop, progress))
             except BaseException as exc:  # noqa: BLE001 -- handed over to the main thread
                 future.set_exception(exc)
 
@@ -360,7 +385,7 @@ class Worker:
         solver_thread.start()
         watchdog.start()
         try:
-            self._wait(future, stop, address)
+            self._wait(future, stop, progress, address)
         finally:
             watchdog.cancel()
             if not future.done():  # leaving on an exception: do not leave the search running
@@ -377,12 +402,17 @@ class Worker:
             return Result(status=SolveStatus.MODEL_INVALID), ErrorCode.INTERNAL
         return future.result(), None
 
-    def _wait(self, future: Future[Result], stop: StopHandle, address: Address) -> None:
+    def _wait(
+        self, future: Future[Result], stop: StopHandle, progress: Progress, address: Address
+    ) -> None:
         stop_deadline: float | None = None
+        stall_check = True
         while not future.done():
             wait([future], timeout=WAIT_SLICE_S)
             self.producer.poll(0)
             self._beat()
+            if stall_check:
+                stall_check = self._check_progress(progress, address)
             if self._stopping():
                 stop.stop()
                 if stop_deadline is None:
@@ -390,6 +420,22 @@ class Worker:
                 elif self.monotonic() > stop_deadline and not future.done():
                     jsonlog.log(ERROR, "engine.ignored_stop", **_ids(address))
                     raise WorkerFatalError
+
+    @staticmethod
+    def _check_progress(progress: Progress, address: Address) -> bool:
+        """The no-improvement stop is advisory: a failure turns it off for this job only."""
+        try:
+            progress.check()
+        except Exception as exc:  # noqa: BLE001 -- must not fail the job or skip SIGTERM handling
+            jsonlog.log(
+                ERROR,
+                "progress.check_failed",
+                **_ids(address),
+                error_class=type(exc).__name__,
+                where=jsonlog.where(exc),
+            )
+            return False
+        return True
 
     def _watchdog(self, address: Address) -> None:
         try:
@@ -410,23 +456,29 @@ class Worker:
 
     def _retrying(self, action: Callable[[], None], what: str, address: Address | None) -> None:
         ids = _ids(address)
-        # Once stopping there is no time budget for retries (compose stop_grace_period).
-        delays = (None,) if self._stop_requested else (*RETRY_DELAYS_S, None)
-        for attempt, delay in enumerate(delays, start=1):
+        for attempt, delay in enumerate((*RETRY_DELAYS_S, None), start=1):
             try:
                 action()
             except TransientKafkaError as exc:
-                if delay is None:
+                # Once stopping there is no time budget for retries (compose stop_grace_period),
+                # also when the stop arrives between two attempts.
+                if delay is None or self._stop_requested:
                     jsonlog.log(
                         ERROR,
                         f"{what}.gave_up",
                         **ids,
                         attempt=attempt,
                         error_class=type(exc).__name__,
+                        reason=_reason(exc),
                     )
                     raise WorkerFatalError from None
                 jsonlog.log(
-                    WARNING, f"{what}.retry", **ids, attempt=attempt, error_class=type(exc).__name__
+                    WARNING,
+                    f"{what}.retry",
+                    **ids,
+                    attempt=attempt,
+                    error_class=type(exc).__name__,
+                    reason=_reason(exc),
                 )
                 self._beat()  # retries can take 7 s; stay healthy meanwhile
                 self.sleep(delay)
@@ -457,6 +509,8 @@ class Worker:
         try:
             dlq = dlq_message(message, topic=self.config.build_dlq_topic, error_class=error_class)
             self.producer.send([dlq], self._flush_timeout(self.config.started_flush_timeout_s))
+        except FatalKafkaError:
+            raise  # the client is unusable (error_cb during flush): exit 1, not "best effort"
         except Exception as exc:  # noqa: BLE001 -- best effort; class only, never the payload
             jsonlog.log(
                 ERROR,
@@ -481,8 +535,13 @@ class Worker:
             size_bytes=len(completed.message.value or b""),
             solver_version=__version__,
             model_version=MODEL_VERSION,
+            handle_ms=self._handle_ms(),
             **fields,
         )
+
+    def _handle_ms(self) -> int:
+        """Processing time of the current message: received -> answer sent (and committed)."""
+        return round((self.monotonic() - self._received_at) * 1000)
 
 
 def _ids(address: Address | None) -> dict[str, object]:
@@ -493,6 +552,22 @@ def _ids(address: Address | None) -> dict[str, object]:
         "school_id": str(address.school_id),
         "correlation_id": address.correlation_id,
     }
+
+
+def _reason(exc: TransientKafkaError) -> str | None:
+    """The librdkafka error name (or fixed literal) that kafka_io put in the exception."""
+    return str(exc) or None
+
+
+def _ms(seconds: float | None) -> int | None:
+    return None if seconds is None else round(seconds * 1000)
+
+
+def _gap(objective: int | None, bound: float | None) -> float | None:
+    """(bound - objective) / bound of phase A; the CP-SAT bound is weak, so read it with care."""
+    if objective is None or not bound:
+        return None
+    return round(max(0.0, (bound - objective) / bound), 4)
 
 
 def _ms_between(outcome: Accepted, now: datetime) -> int | None:

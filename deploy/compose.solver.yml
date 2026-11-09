@@ -25,7 +25,9 @@ services:
     init: true                    # SIGTERM reaches the worker; zombies are reaped
     restart: unless-stopped       # exit 1 (fatal Kafka error, watchdog) -> restart
     stop_grace_period: 30s        # SIGTERM -> stop CP-SAT -> publish best solution -> exit 0
-    cpus: 4                       # = SOLVER_NUM_WORKERS; keeps the API on the same VM responsive
+    # Demo VM has 2 vCPU: Docker refuses cpus above the host's CPU count, and the API services
+    # share the VM (ADR 2026-11-08). 2 CP-SAT workers on 1.5 CPUs.
+    cpus: 1.5
     # Measured peak RSS of the whole solver process: 222 MB (45-class school, 4 CP-SAT workers).
     # CP-SAT is capped at SOLVER_MAX_MEMORY_MB (~0.7 x mem_limit) and returns its best solution.
     mem_limit: 768m
@@ -37,13 +39,17 @@ services:
       SOLVER_BUILD_DLQ_TOPIC: solve.build.requested.dlq
       SOLVER_MIN_TIME_LIMIT_S: "10"
       SOLVER_MAX_TIME_LIMIT_S: "180"
-      SOLVER_NUM_WORKERS: "4"
+      SOLVER_NUM_WORKERS: "2"
       SOLVER_SEED: "0"
       SOLVER_STOP_GRACE_S: "20"   # < stop_grace_period, leaves time to publish and close
       SOLVER_STOP_FLUSH_TIMEOUT_S: "4"  # once stopping: completed flush + close flush, 4 s each
       SOLVER_SHUTDOWN_BUDGET_S: "29"    # grace + 2 x flush + 1 s must fit; < stop_grace_period
       SOLVER_MAX_MEMORY_MB: "512"
       SOLVER_WATCHDOG_MARGIN_S: "60"
+      # No-improvement stop of phase A (ADR 2026-11-08). Keep 0 (off) until timetable validates
+      # against the contracts version with stop_reason "no_improvement"; then set 8.
+      SOLVER_STALL_MIN_S: "0"
+      SOLVER_STALL_RATIO: "1.0"
       SOLVER_HEARTBEAT_FILE: /tmp/lad-solver.alive
       KAFKA_MAX_POLL_INTERVAL_MS: "300000"   # must exceed (max limit + watchdog margin) * 1000
       KAFKA_SESSION_TIMEOUT_MS: "10000"

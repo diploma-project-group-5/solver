@@ -6,6 +6,7 @@ lessons of c held in person on d. Lesson numbers are left to phase B, which is a
 because class-day and teacher-day loads are <= L (König's edge-colouring theorem).
 """
 
+import time
 from dataclasses import dataclass, field
 
 from ortools.sat.python import cp_model
@@ -14,7 +15,10 @@ from lad_solver.domain.problem import AlertLimits
 from lad_solver.domain.result import SolveStatus
 from lad_solver.model.cpsat import RunInfo, SolverConfig, run
 from lad_solver.model.index import Index
+from lad_solver.model.progress import Progress
 from lad_solver.model.stop import StopHandle
+
+MIN_RUN_S = 0.05  # floor of a search budget, even past the deadline
 
 type RowDay = tuple[int, int]  # (row position, day)
 type ClassDay = tuple[int, int]  # (class position, day)
@@ -52,6 +56,10 @@ class PhaseAModel:
     b: dict[tuple[int, int, int], cp_model.IntVar] = field(
         default_factory=dict[tuple[int, int, int], cp_model.IntVar]
     )
+    # q[c,d] with its cap M_c and the priority rows of c: needed to hint the objective terms
+    q: dict[ClassDay, tuple[cp_model.IntVar, int, tuple[int, ...]]] = field(
+        default_factory=dict[ClassDay, tuple[cp_model.IntVar, int, tuple[int, ...]]]
+    )
 
 
 def score(index: Index, plan: DayPlan) -> Score:
@@ -65,15 +73,22 @@ def score(index: Index, plan: DayPlan) -> Score:
     return Score(primary, secondary, index.weight * primary + secondary)
 
 
-def solve_phase_a(
+def solve_phase_a(  # noqa: PLR0913 - keyword-only hint/progress/deadline
     index: Index,
     caps: tuple[int, ...],
     config: SolverConfig,
     stop: StopHandle | None = None,
+    *,
     hint: DayPlan | None = None,
+    progress: Progress | None = None,
+    deadline: float | None = None,
 ) -> PhaseAOutcome:
+    """``deadline`` (``time.monotonic()``): the search gets what is left after model building."""
     built = build_phase_a(index, caps, hint)
-    solver, info = run(built.model, config, stop)
+    if deadline is not None:
+        left = max(deadline - time.monotonic(), MIN_RUN_S)
+        config = config.with_time(left, config.max_deterministic_time)
+    solver, info = run(built.model, config, stop, progress=progress)
     if info.status not in {SolveStatus.OPTIMAL, SolveStatus.FEASIBLE}:
         return PhaseAOutcome(info, None)
     loads = {k: v for k, var in built.y.items() if (v := int(solver.value(var))) > 0}
@@ -150,14 +165,22 @@ def _pair_has_lessons(
 
 
 def _add_capacity(m: PhaseAModel, index: Index) -> None:
+    """Per day: students (+ staff + teachers on site) within the limits.
+
+    The right-hand sides are clamped to what a day can hold at most, so that limits beyond
+    int64 (CP-SAT constants) mean "unlimited" instead of crashing the model build. Staff moves
+    to the right-hand side: ``passport - staff`` is exact in Python and >= 0 after pre-checks.
+    """
     capacity = index.problem.capacity
-    staff = index.problem.staff
+    total_pupils = sum(index.students)
+    free = min(capacity.passport - index.problem.staff, total_pupils + len(index.problem.teachers))
+    seats = min(capacity.seats, total_pupils) if isinstance(capacity, AlertLimits) else None
     for d in index.days:
         students = sum(index.students[c] * f for (c, day), f in m.f.items() if day == d)
         teachers = sum(z for (_, day), z in m.z.items() if day == d)
-        if isinstance(capacity, AlertLimits):
-            m.model.add(students <= capacity.seats).with_name(f"seats_{d}")
-        m.model.add(students + staff + teachers <= capacity.passport).with_name(f"passport_{d}")
+        if seats is not None:
+            m.model.add(students <= seats).with_name(f"seats_{d}")
+        m.model.add(students + teachers <= free).with_name(f"passport_{d}")
 
 
 def _add_outside_shelter(m: PhaseAModel, index: Index, caps: tuple[int, ...]) -> None:
@@ -199,6 +222,7 @@ def _priority_in_person(
         m.model.add(q <= sum(prio))
         m.model.add(q <= m_c * m.f[c, d])
         q_vars.append(q)
+        m.q[c, d] = (q, m_c, tuple(r for r in prio_rows if (r, d) in m.y))
     m.model.add(sum(q_vars) <= sum(index.row_hours[r] for r in prio_rows))  # redundant cut
     return q_vars
 
@@ -221,3 +245,8 @@ def _add_hints(m: PhaseAModel, index: Index, hint: DayPlan | None) -> None:
             for r in index.rows_by_teacher[t]
         )
         m.model.add_hint(z, int(on_site))
+    # Objective terms too: without them the follow-up starts below the probe's best and spends
+    # seconds climbing back (ADR 2026-11-08). q = min(priority lessons, M_c * f).
+    for (c, d), (q, m_c, rows) in m.q.items():
+        priority_lessons = sum(hint.loads.get((r, d), 0) for r in rows)
+        m.model.add_hint(q, min(priority_lessons, m_c * int((c, d) in hint.in_person)))

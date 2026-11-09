@@ -14,6 +14,8 @@ from pydantic import ValidationError
 from lad_solver.adapters.kafka.payload import BuildRequested
 
 MARKER = "Іваненко-MARKER-7f3a"  # Cyrillic on purpose: non-ASCII must not slip through
+# The DLQ copy is ASCII-escaped JSON: the marker must not survive in that form either.
+ESCAPED = json.dumps(MARKER).strip('"').encode()
 
 
 def _with_personal_data(document: Json) -> Json:
@@ -33,11 +35,42 @@ def _no_job_id(data: Json) -> None:
     data.pop("job_id")
 
 
+def _in_teacher_id(data: Json) -> None:
+    data["teachers"][0]["id"] = MARKER  # a signature typed into an id field
+
+
+def _in_kind(data: Json) -> None:
+    data["kind"] = MARKER
+
+
+def _in_school_days(data: Json) -> None:
+    data["school_days"] = [1, MARKER]
+
+
+def _in_contract_fields(document: Json) -> Json:
+    """Personal data in fields the contract knows: the field name alone must not let it pass."""
+    changed = with_data(document, _in_teacher_id)
+    changed["source"] = MARKER
+    return changed
+
+
+def _without_school_id(document: Json) -> Json:
+    changed = dict(document)
+    changed.pop("school_id")
+    return changed
+
+
 CASES: dict[str, Json] = {
     "accepted": _with_personal_data(build_request()),
     "rejected": with_data(_with_personal_data(build_request()), _invalid),
     "poison": with_data(_with_personal_data(build_request()), _no_job_id),
     "expired": _with_personal_data(build_request(queue_deadline_at="2026-11-01T00:00:00Z")),
+    "rejected-teacher-id": _in_contract_fields(build_request()),
+    "rejected-kind": with_data(build_request(), _in_kind),
+    "rejected-school-days": with_data(build_request(), _in_school_days),
+    "poison-contract-fields": _without_school_id(
+        with_data(_in_contract_fields(build_request()), _in_kind)
+    ),
 }
 
 
@@ -51,11 +84,15 @@ def test_marker_never_leaves_the_worker(case: str, capsys: pytest.CaptureFixture
     assert MARKER not in out
     assert MARKER not in err
     assert h.producer.sent, "every case produces at least one message"
+    if case.startswith(("rejected", "poison")):
+        assert h.producer.dlq(), "the redacted DLQ copy is still produced"
     for message in h.producer.sent:
         assert MARKER.encode() not in (message.value or b"")
+        assert ESCAPED not in (message.value or b"")
         for name, value in message.headers:
             assert MARKER not in name
             assert MARKER.encode() not in value
+            assert ESCAPED not in value
 
 
 def test_marker_never_reaches_the_engine() -> None:

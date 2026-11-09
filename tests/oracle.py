@@ -19,6 +19,11 @@ class Objective:
     value: int
 
 
+def in_person_days(result: Result) -> set[tuple[str, int]]:
+    """(class_id, day) of every in-person class day."""
+    return {(f.class_id, f.day) for f in result.day_formats if f.in_person}
+
+
 def violations(problem: Problem, result: Result) -> list[str]:
     """Every broken rule as a human-readable line; empty means the result is admissible."""
     if result.status not in {SolveStatus.OPTIMAL, SolveStatus.FEASIBLE}:
@@ -34,7 +39,7 @@ def objective(problem: Problem, result: Result) -> Objective:
     students = {c.id: c.students for c in problem.classes}
     flagged = {c.id for c in problem.classes if c.priority}
     priority_subjects = {s.id for s in problem.subjects if s.priority_area}
-    in_person = {(f.class_id, f.day) for f in result.day_formats if f.in_person}
+    in_person = in_person_days(result)
     primary = sum(
         students[x.class_id]
         for x in result.lessons
@@ -77,7 +82,7 @@ def _formats(problem: Problem, result: Result) -> list[str]:
     wanted = {(c.id, d) for c in problem.classes for d in problem.school_days}
     if set(keys) != wanted or any(n > 1 for n in keys.values()):
         out.append("day formats do not cover every class x school day exactly once")
-    in_person = {(f.class_id, f.day) for f in result.day_formats if f.in_person}
+    in_person = in_person_days(result)
     busy = {(x.class_id, x.day) for x in result.lessons}
     out.extend(f"empty in-person day {k}" for k in in_person - busy)
     formats: defaultdict[tuple[str, int], set[bool]] = defaultdict(set)
@@ -103,7 +108,7 @@ class DayLoad:
 
 def day_load(problem: Problem, result: Result, day: int) -> DayLoad:
     students = {c.id: c.students for c in problem.classes}
-    in_person = {(f.class_id, f.day) for f in result.day_formats if f.in_person}
+    in_person = in_person_days(result)
     pupils = sum(students[c] for c, d in in_person if d == day)
     teachers = {
         x.teacher_id for x in result.lessons if (x.class_id, x.day) in in_person and x.day == day
