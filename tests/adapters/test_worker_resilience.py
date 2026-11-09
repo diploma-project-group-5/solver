@@ -5,6 +5,7 @@ Each test names the review item it pins down (ADR 2026-11-04 §4).
 
 import json
 import threading
+from dataclasses import replace
 from datetime import UTC, datetime
 
 import pytest
@@ -15,6 +16,7 @@ from kafka_support import (
     Json,
     build_request,
     encode,
+    feasible_result,
     harness,
     with_data,
 )
@@ -22,6 +24,7 @@ from kafka_support import (
 from lad_solver.adapters.kafka import mapping
 from lad_solver.domain.problem import Params, Problem
 from lad_solver.domain.result import Conflict, ConflictRule, Result, SolveStatus
+from lad_solver.model.progress import Progress, StallPolicy
 from lad_solver.model.stop import StopHandle
 
 
@@ -49,9 +52,11 @@ def test_request_stop_only_sets_a_flag(capsys: pytest.CaptureFixture[str]) -> No
     seen: list[tuple[int, str]] = []
 
     class AttachingEngine(FakeEngine):
-        def __call__(self, problem: Problem, params: Params, stop: StopHandle) -> Result:
+        def __call__(
+            self, problem: Problem, params: Params, stop: StopHandle, progress: Progress
+        ) -> Result:
             stop.attach(stoppable)
-            return super().__call__(problem, params, stop)
+            return super().__call__(problem, params, stop, progress)
 
     engine = AttachingEngine(Journal(), wait_for_stop=True)
     h = harness(engine=engine)
@@ -110,9 +115,11 @@ def test_heartbeat_failure_mid_solve_stops_the_engine_and_exits_1(
     handles: list[StopHandle] = []
 
     class CapturingEngine(FakeEngine):
-        def __call__(self, problem: Problem, params: Params, stop: StopHandle) -> Result:
+        def __call__(
+            self, problem: Problem, params: Params, stop: StopHandle, progress: Progress
+        ) -> Result:
             handles.append(stop)
-            return super().__call__(problem, params, stop)
+            return super().__call__(problem, params, stop, progress)
 
     engine = CapturingEngine(Journal(), wait_for_stop=True)
     h = harness(engine=engine)
@@ -460,3 +467,157 @@ def test_any_failure_building_the_dlq_copy_is_logged_and_committed(
 
     assert h.consumer.committed == [7]
     assert len(_events(capsys.readouterr().out, "dlq.failed")) == 1
+
+
+# ---------------------------------------------------------------- 10. stall stop and timings
+
+
+def test_wait_loop_ticks_the_no_improvement_stop(capsys: pytest.CaptureFixture[str]) -> None:
+    class PlateauEngine(FakeEngine):
+        """Reports one solution, then waits for the worker's stall check to stop it."""
+
+        def __call__(
+            self, problem: Problem, params: Params, stop: StopHandle, progress: Progress
+        ) -> Result:
+            assert params.stall_min_s == 0.2
+            stopped = threading.Event()
+
+            class Stopper:
+                def stop_search(self) -> None:
+                    stopped.set()
+
+            progress.begin(StallPolicy(min_s=0.2, ratio=1.0))
+            progress.attach(Stopper())
+            progress.record(10)
+            self.stop_seen = stopped.wait(timeout=10)
+            progress.detach()
+            return super().__call__(problem, params, stop, progress)
+
+    engine = PlateauEngine(Journal())
+    h = harness(engine=engine, stall_min_s=0.2)
+
+    assert h.run(encode(build_request())) == 0
+
+    assert engine.stop_seen  # the worker's main loop ran progress.check()
+    assert engine.calls[0][1].stall_min_s is not None
+    started = _events(capsys.readouterr().out, "job.started")[0]
+    assert started["stall_min_s"] == 0.2
+
+
+def test_stall_is_off_by_default_in_the_worker() -> None:
+    h = harness()
+
+    h.run(encode(build_request()))
+
+    assert h.engine.calls[0][1].stall_min_s is None
+
+
+def test_completed_log_carries_processing_and_search_timings(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    base = feasible_result()
+    timed = replace(base, stats=replace(base.stats, first_solution_s=0.2, last_improvement_s=0.9))
+    h = harness(engine=FakeEngine(Journal(), result=timed))
+
+    h.run(encode(build_request()))
+
+    completed = _events(capsys.readouterr().out, "job.completed")[0]
+    for key in ("handle_ms", "wall_time_ms", "first_solution_ms", "last_improvement_ms", "gap"):
+        assert key in completed, key
+    assert (completed["first_solution_ms"], completed["last_improvement_ms"]) == (200, 900)
+    assert completed["gap"] == round((150 - 140) / 150, 4)
+    assert isinstance(completed["handle_ms"], int)
+    assert completed["handle_ms"] >= completed["wall_time_ms"]
+
+
+def test_poison_log_carries_the_processing_time(capsys: pytest.CaptureFixture[str]) -> None:
+    h = harness()
+
+    h.run(b"not json")
+
+    done = _events(capsys.readouterr().out, "message.done")
+    assert len(done) == 1
+    assert isinstance(done[0]["handle_ms"], int)
+
+
+def test_a_failing_stall_check_is_logged_and_does_not_fail_the_job(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def broken(_self: Progress) -> bool:
+        raise RuntimeError
+
+    monkeypatch.setattr(Progress, "check", broken)
+    release = threading.Event()
+    timer = threading.Timer(1.2, release.set)  # the engine outlives at least two wait ticks
+    h = harness(engine=FakeEngine(Journal(), ignore_stop=release), stall_min_s=8.0)
+    timer.start()
+    try:
+        assert h.run(encode(build_request())) == 0
+    finally:
+        timer.cancel()
+
+    assert h.producer.of_type("solve.completed")[0]["data"]["status"] == "FEASIBLE"
+    failed = _events(capsys.readouterr().out, "progress.check_failed")
+    assert len(failed) == 1  # logged once, then the rule is off for this job
+
+
+# ---------------------------------------------------------------- audit: retries, fatal DLQ, logs
+
+
+def test_stop_during_a_retry_pause_cuts_the_remaining_retries(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    h = harness()
+    h.consumer.on_idle = None
+    h.producer.fail_types["solve.started"] = 99
+
+    def sleep_then_stop(seconds: float) -> None:
+        h.sleeps.append(seconds)
+        h.worker.request_stop()  # SIGTERM lands inside the first pause
+
+    h.worker.sleep = sleep_then_stop
+
+    assert h.run(encode(build_request())) == 1
+
+    assert h.sleeps == [1.0]  # no 2 s and 4 s pauses on top of the stop budget
+    assert h.consumer.committed == []
+    [gave_up] = _events(capsys.readouterr().out, "solve.started.gave_up")
+    assert (gave_up["attempt"], gave_up["reason"]) == (2, "flush")
+
+
+def test_retry_and_unhealthy_logs_carry_the_kafka_reason(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    h = harness()
+    h.consumer.poll_errors = 30
+    h.producer.fail_types["solve.started"] = 1
+
+    assert h.run(encode(build_request())) == 0
+
+    out = capsys.readouterr().out
+    assert _events(out, "solve.started.retry")[0]["reason"] == "flush"
+    assert _events(out, "consumer.unhealthy")[0]["reason"] == "consumer"
+
+
+def test_fatal_kafka_error_on_the_dlq_copy_exits_1(capsys: pytest.CaptureFixture[str]) -> None:
+    h = harness()
+    h.producer.fatal_types.add("dlq")
+
+    assert h.run(b"not json") == 1
+
+    out = capsys.readouterr().out
+    assert _events(out, "kafka.fatal")
+    assert not _events(out, "dlq.failed")
+    assert h.consumer.committed == []  # redelivered after the restart
+
+
+def test_engine_failure_log_has_no_search_telemetry(capsys: pytest.CaptureFixture[str]) -> None:
+    h = harness(engine=FakeEngine(Journal(), error=RuntimeError("boom")))
+
+    assert h.run(encode(build_request())) == 0
+
+    [completed] = _events(capsys.readouterr().out, "job.completed")
+    assert completed["error_code"] == "internal"
+    assert "wall_time_ms" in completed
+    for field_name in ("stop_reason", "num_workers", "quality_relaxed", "objective"):
+        assert field_name not in completed

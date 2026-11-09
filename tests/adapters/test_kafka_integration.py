@@ -5,6 +5,7 @@ platform runs) is started as a generic container: the advertised listener must e
 port, hence a fixed free port chosen up front. Waits are deadline-bounded polls, never sleeps.
 """
 
+import hashlib
 import json
 import os
 import signal
@@ -244,7 +245,9 @@ def test_started_then_completed_keyed_by_school_and_offset_committed(
 def test_real_engine_end_to_end_through_the_broker(bootstrap: str, topics: Topics) -> None:
     """The CP-SAT engine itself behind the worker: request in, full timetable out."""
     _send(bootstrap, topics.build, encode(build_request(queue_deadline_at=_future_deadline())))
-    running = _start_worker(bootstrap, topics, solve)
+    running = _start_worker(
+        bootstrap, topics, lambda pr, pa, st, prog: solve(pr, pa, st, progress=prog)
+    )
     try:
         _, completed = _read(bootstrap, topics.status, 2)
     finally:
@@ -284,7 +287,13 @@ def test_poison_message_lands_in_dlq_and_is_committed(bootstrap: str, topics: To
     finally:
         assert running.stop() == 0
 
-    assert dead.value == b"definitely not json"
+    raw = b"definitely not json"
+    assert dead.value is not None
+    assert json.loads(dead.value) == {  # never the raw bytes: they may carry personal data
+        "unparseable": True,
+        "size_bytes": len(raw),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+    }
     assert dead.headers["x-error-class"] == b"not_json"
     assert dead.headers["x-original-offset"] == b"0"
 
@@ -296,7 +305,7 @@ from lad_solver.adapters.kafka.config import WorkerConfig
 from lad_solver.adapters.kafka.kafka_io import KafkaConsumer, KafkaProducer
 from lad_solver.adapters.kafka.worker import Worker
 
-def never_returns(problem, params, stop):
+def never_returns(problem, params, stop, progress):
     threading.Event().wait()
 
 jsonlog.configure()

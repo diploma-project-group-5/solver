@@ -5,17 +5,19 @@ from dataclasses import replace
 from typing import Any
 
 import pytest
+from ortools.sat.python import cp_model
 
 import oracle
 from builders import OTHER, PRIO, klass, problem, row, teacher
 from lad_solver.app import solve as solve_module
 from lad_solver.domain.problem import Params, Problem
-from lad_solver.domain.result import SolveStatus
-from lad_solver.model import phase_a
-from lad_solver.model.cpsat import SolverConfig
+from lad_solver.domain.result import SolveStatus, StopReason
+from lad_solver.model import phase_a, phase_b
+from lad_solver.model.cpsat import RunInfo, SolverConfig
 from lad_solver.model.index import Index
 from lad_solver.model.phase_a import DayPlan, PhaseAOutcome
 from lad_solver.model.phase_b import DayAssignment, DayDemand, assign_day
+from lad_solver.model.progress import Progress
 from lad_solver.model.stop import StopHandle
 
 PARAMS = Params(time_limit_s=10, num_workers=1, random_seed=0)
@@ -96,6 +98,40 @@ def test_phase_b_that_never_finishes_is_unknown_without_objective(
     assert result.lessons == ()
     stats = result.stats
     assert (stats.objective, stats.best_bound, stats.primary, stats.secondary) == (None,) * 4
+    assert stats.stop_reason is StopReason.TIME_LIMIT  # not phase A's "completed": no grid
+
+
+def test_phase_b_day_runs_cp_sat_at_most_twice(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Compact model, then one feasibility retry: never the compact model's own fallback on top,
+    # so a day costs at most day_limit + PHASE_B_RETRY_S and the reserve holds.
+    runs: list[bool] = []
+
+    def unknown(*_args: object, has_objective: bool = True, **_kwargs: object) -> object:
+        runs.append(has_objective)
+        return cp_model.CpSolver(), RunInfo(SolveStatus.UNKNOWN, None)
+
+    monkeypatch.setattr(phase_b, "run", unknown)
+
+    result = solve_module.solve(_problem(), PARAMS)
+
+    assert result.status is SolveStatus.UNKNOWN
+    assert runs == [True, False]  # the first day gave up: compact, then the retry
+
+
+def test_assign_day_alone_keeps_its_feasibility_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    runs: list[bool] = []
+
+    def unknown(*_args: object, has_objective: bool = True, **_kwargs: object) -> object:
+        runs.append(has_objective)
+        return cp_model.CpSolver(), RunInfo(SolveStatus.UNKNOWN, None)
+
+    monkeypatch.setattr(phase_b, "run", unknown)
+    demands = [DayDemand(0, "a", "t1", 1)]
+
+    assigned = assign_day(1, demands, 2, config=SolverConfig(time_limit_s=1))
+
+    assert assigned == DayAssignment(None, SolveStatus.UNKNOWN)
+    assert runs == [True, False]
 
 
 @pytest.mark.parametrize("failure", [SolveStatus.INFEASIBLE, SolveStatus.MODEL_INVALID])
@@ -121,15 +157,18 @@ def test_follow_up_model_invalid_keeps_the_probe_plan_and_is_recorded(
     real = phase_a.solve_phase_a
     runs: list[int] = []
 
-    def fake(
+    def fake(  # noqa: PLR0913 - mirrors solve_phase_a
         index: Index,
         caps: tuple[int, ...],
         config: SolverConfig,
         stop: StopHandle | None = None,
+        *,
         hint: DayPlan | None = None,
+        progress: Progress | None = None,
+        deadline: float | None = None,
     ) -> PhaseAOutcome:
         runs.append(1)
-        outcome = real(index, caps, config, stop, hint)
+        outcome = real(index, caps, config, stop, hint=hint, progress=progress, deadline=deadline)
         if len(runs) == 1:  # the probe: pretend it was not proven optimal
             return replace(outcome, info=replace(outcome.info, status=SolveStatus.FEASIBLE))
         return PhaseAOutcome(replace(outcome.info, status=SolveStatus.MODEL_INVALID), None)

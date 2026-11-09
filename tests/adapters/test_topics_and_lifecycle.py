@@ -26,6 +26,11 @@ CONTRACTS = Path(os.environ.get("LAD_CONTRACTS_DIR", str(_DEFAULT)))
 MANIFEST = CONTRACTS / "topics.v1.json"
 LIFECYCLE = CONTRACTS / "vectors" / "job-lifecycle"
 
+# CI sets LAD_CONTRACTS_DIR: there a moved or renamed layout must fail loudly, not skip.
+if "LAD_CONTRACTS_DIR" in os.environ and not MANIFEST.is_file():
+    msg = "LAD_CONTRACTS_DIR is set but the contracts layout is missing"
+    raise RuntimeError(msg)
+
 pytestmark = pytest.mark.skipif(
     not MANIFEST.is_file(),
     reason=(

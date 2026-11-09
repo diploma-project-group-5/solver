@@ -2,7 +2,7 @@
 
 This is the CLI/bench file format, NOT the Kafka contract (that lives in ``contracts`` and is
 mapped by the Kafka adapter). Parsing raises ``TypeError`` for a wrong JSON type and
-``ValueError`` for a bad enum value.
+``ValueError`` for a bad enum value or a capacity shape that does not match the kind.
 """
 
 import json
@@ -94,12 +94,18 @@ def read_json(path: Path) -> Json:
 
 
 def problem_from_json(data: Json) -> Problem:
+    kind = TimetableKind(_str(data, "kind"))
+    capacity = _capacity(_obj(data.get("capacity"), "capacity"))
+    # 1.1 counts everyone against the passport; 1.2 also needs seats. A mismatch builds a hybrid.
+    if isinstance(capacity, AlertLimits) != (kind is TimetableKind.ALERT):
+        msg = "capacity: shape does not match kind"
+        raise ValueError(msg)
     return Problem(
-        kind=TimetableKind(_str(data, "kind")),
+        kind=kind,
         school_days=tuple(_int_item(d, "school_days") for d in _list(data, "school_days")),
         lessons_per_day=_int(data, "lessons_per_day"),
         staff=_int(data, "staff"),
-        capacity=_capacity(_obj(data.get("capacity"), "capacity")),
+        capacity=capacity,
         classes=tuple(
             SchoolClass(_str(o, "id"), _int(o, "students"), _bool(o, "priority"))
             for o in _objects(data, "classes")
@@ -162,13 +168,14 @@ def _conflict(o: Json) -> Conflict:
         subject_id=_opt_str(o, "subject_id"),
         day=_opt_int(o, "day"),
         condition=None if condition is None else CapacityCondition(condition),
-        hint=bool(o.get("hint", False)),
+        hint=_bool(o, "hint") if "hint" in o else False,
     )
 
 
 def _stats(o: Json) -> Stats:
     best_bound = o.get("best_bound")
     first = o.get("first_solution_s")
+    last = o.get("last_improvement_s")
     return Stats(
         objective=_opt_int(o, "objective"),
         best_bound=None if best_bound is None else _float(best_bound, "best_bound"),
@@ -176,6 +183,7 @@ def _stats(o: Json) -> Stats:
         secondary=_opt_int(o, "secondary"),
         wall_time_s=_float(o.get("wall_time_s"), "wall_time_s"),
         first_solution_s=None if first is None else _float(first, "first_solution_s"),
+        last_improvement_s=None if last is None else _float(last, "last_improvement_s"),
         phase_a_status=_opt_str(o, "phase_a_status"),
         quality_relaxed=_bool(o, "quality_relaxed"),
         stop_reason=StopReason(_str(o, "stop_reason")),

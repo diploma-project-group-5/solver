@@ -32,7 +32,7 @@ dev = [
     "pytest>=9.2",
     "pytest-cov>=7.1",
     "ruff>=0.17.3",
-    "testcontainers[kafka]>=4.15.0",
+    "testcontainers>=4.15.0",
 ]
 
 [build-system]

@@ -51,13 +51,15 @@ def assign_day(  # noqa: PLR0913 - mirrors the ADR signature plus solver setting
     config: SolverConfig,
     stop: StopHandle | None = None,
     compact: bool = True,
+    fallback: bool = True,
 ) -> DayAssignment:
     """Lesson numbers per demand key.
 
     ``fixed`` pins (key, lesson_no) pairs (substitutions); ``hint`` suggests lesson numbers.
-    If the compact model ends UNKNOWN, a feasibility-only model is tried with the same limit.
+    If the compact model ends UNKNOWN and ``fallback`` is set, a feasibility-only model is tried
+    with the same limit; a caller with its own retry passes ``fallback=False``.
     """
-    attempts = (True, False) if compact else (False,)
+    attempts = (True, False) if compact and fallback else (compact,)
     status = SolveStatus.UNKNOWN
     for with_objective in attempts:
         model, x = _build(day, lessons, lessons_per_day, fixed, hint, objective=with_objective)

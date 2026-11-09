@@ -5,6 +5,7 @@ live here; the Kafka adapter strips them before building a ``Problem``
 (ADR 2026-11-04, spec §04 "minimum PD").
 """
 
+import math
 from dataclasses import dataclass, field
 from enum import StrEnum
 
@@ -90,3 +91,28 @@ class Params:
     max_deterministic_time: float | None = None  # set for reproducible seed generation
     interleave_search: bool = False  # deterministic multi-worker search (seed generation)
     max_memory_mb: int | None = None  # CP-SAT max_memory_in_mb; None = no limit (CLI, tests)
+    # Stop phase A after max(stall_min_s, stall_ratio * time to the last improvement) without
+    # an improvement (ADR 2026-11-08). None = off (engine default: tests and bench reproducible).
+    stall_min_s: float | None = None
+    stall_ratio: float = 1.0
+
+    def __post_init__(self) -> None:
+        if not (math.isfinite(self.time_limit_s) and self.time_limit_s > 0):
+            msg = f"time_limit_s must be a finite number > 0, got {self.time_limit_s!r}"
+            raise ValueError(msg)
+        for name, value in (
+            ("phase_b_reserve_s", self.phase_b_reserve_s),
+            ("max_deterministic_time", self.max_deterministic_time),
+        ):
+            if value is not None and not (math.isfinite(value) and value >= 0):
+                msg = f"{name} must be a finite number >= 0, got {value!r}"
+                raise ValueError(msg)
+        if self.stall_min_s is None:
+            return
+        for name, value in (("stall_min_s", self.stall_min_s), ("stall_ratio", self.stall_ratio)):
+            if not (math.isfinite(value) and value > 0):
+                msg = f"{name} must be a finite number > 0, got {value!r}"
+                raise ValueError(msg)
+        if self.max_deterministic_time is not None:
+            msg = "stall_min_s is a wall-clock rule: not allowed with max_deterministic_time"
+            raise ValueError(msg)

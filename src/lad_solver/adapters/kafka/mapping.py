@@ -6,16 +6,18 @@ unit-tested here without Kafka.
 
 import hashlib
 import json
+import math
 import re
 from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
+from functools import cache
 from types import UnionType
-from typing import Annotated, Final, TypeAliasType, Union, get_args, get_origin
+from typing import Annotated, Any, Final, TypeAliasType, Union, get_args, get_origin
 from uuid import UUID, uuid5
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError
 
 from lad_solver import __version__
 from lad_solver.adapters.kafka.payload import (
@@ -26,6 +28,7 @@ from lad_solver.adapters.kafka.payload import (
     BuildRequested,
     BuildRequestedData,
     EnvelopeHead,
+    Id,
 )
 from lad_solver.adapters.kafka.ports import InboundMessage, OutboundMessage
 from lad_solver.domain.problem import (
@@ -119,9 +122,18 @@ def event_id(job_id: UUID, event_type: str) -> UUID:
 # ---------------------------------------------------------------- inbound
 
 
+_MAX_INT_CHARS: Final = 64  # far beyond any int64; json would refuse > 4300 digits outright
+
+
+def _parse_int(literal: str) -> int | str:
+    """A huge JSON integer stays a string, so validation rejects it as out of range instead of
+    json.loads failing (which would make a valid, addressable job look like non-JSON)."""
+    return int(literal) if len(literal) <= _MAX_INT_CHARS else literal
+
+
 def _load(raw: bytes | None) -> dict[str, object] | Poison:
     try:
-        document: object = json.loads(raw) if raw is not None else None
+        document: object = json.loads(raw, parse_int=_parse_int) if raw is not None else None
     except ValueError, RecursionError:
         return Poison("not_json")
     if not isinstance(document, dict):
@@ -171,7 +183,8 @@ def _envelope_rejection(document: dict[str, object]) -> tuple[ErrorCode, str] | 
     version = document.get("schema_version")
     if not isinstance(version, str) or _SCHEMA_VERSION.fullmatch(version) is None:
         return ErrorCode.INVALID_PAYLOAD, "schema_version"
-    if int(version.split(".", 1)[0]) != SUPPORTED_MAJOR:
+    # A string compare is exact (the pattern forbids leading zeros) and never parses a huge int.
+    if version.split(".", 1)[0] != str(SUPPORTED_MAJOR):
         return ErrorCode.UNSUPPORTED_SCHEMA_VERSION, "schema_version"
     try:
         head = EnvelopeHead.model_validate(document)
@@ -281,6 +294,8 @@ def params_for(  # noqa: PLR0913 -- keyword-only server-side knobs
     num_workers: int,
     seed: int,
     max_memory_mb: int | None = None,
+    stall_min_s: float = 0.0,
+    stall_ratio: float = 1.0,
 ) -> Params:
     """Server-side bounds: the requested limit is clamped, clients never pick solver knobs.
 
@@ -292,6 +307,8 @@ def params_for(  # noqa: PLR0913 -- keyword-only server-side knobs
         num_workers=num_workers,
         random_seed=seed,
         max_memory_mb=max_memory_mb,
+        stall_min_s=stall_min_s or None,
+        stall_ratio=stall_ratio,
     )
 
 
@@ -446,15 +463,56 @@ def _redacted(value: object) -> str:
     return f"<redacted:{type(value).__name__}>"
 
 
+def _is_scalar(item: object) -> bool:
+    if isinstance(item, float):
+        return math.isfinite(item)  # NaN / Infinity would make the DLQ copy invalid JSON
+    return isinstance(item, (bool, int, str))
+
+
 def _is_plain(item: object) -> bool:
     """A JSON scalar or a flat list of scalars (e.g. unavailable_days)."""
-    scalar = (bool, int, float, str)
-    if item is None or isinstance(item, scalar):
+    if item is None or _is_scalar(item):
         return True
     if isinstance(item, list):
         items: list[object] = item  # pyright: ignore[reportUnknownVariableType]
-        return all(isinstance(x, scalar) for x in items)
+        return all(_is_scalar(x) for x in items)
     return False
+
+
+_LEAF_CONFIG: Final = ConfigDict(hide_input_in_errors=True)
+
+
+def _annotated(model: type[BaseModel], name: str) -> object:
+    info = model.model_fields[name]
+    return Annotated[info.annotation, *info.metadata] if info.metadata else info.annotation
+
+
+# Free-text envelope fields of BuildRequested are checked as strictly as the envelope reader does;
+# ``source`` has no contract format, so it is kept only when it looks like an identifier.
+_ENVELOPE_LEAVES: Final[dict[str, object]] = {
+    "schema_version": _annotated(EnvelopeHead, "schema_version"),
+    "correlation_id": _annotated(EnvelopeHead, "correlation_id"),
+    "source": Id | None,
+}
+
+
+@cache
+def _leaf_adapter(model: type[BaseModel], name: str) -> TypeAdapter[Any]:
+    override = _ENVELOPE_LEAVES.get(name) if model is BuildRequested else None
+    annotation: Any = override or _annotated(model, name)  # a type form built at runtime
+    return TypeAdapter[Any](annotation, config=_LEAF_CONFIG)
+
+
+def _leaf(model: type[BaseModel], name: str, item: object) -> object:
+    """A contract leaf is copied only when it is a valid value of that field: a field name alone
+    does not make its value safe (a signature typed into ``teachers[].id`` stays out)."""
+    if not _is_plain(item):
+        return _redacted(item)
+    try:
+        _leaf_adapter(model, name).validate_python(item)
+    except ValidationError:
+        return _redacted(item)
+    return item
 
 
 MAX_DLQ_DEPTH: Final = 16  # the contract nests at most 4 levels; deeper input is redacted
@@ -483,22 +541,49 @@ def _project(value: object, models: list[type[BaseModel]], depth: int = 0) -> ob
             if nested:
                 projected[name] = _project(item, nested, depth + 1)
             else:
-                projected[name] = item if _is_plain(item) else _redacted(item)
+                projected[name] = _leaf(model, name, item)
     return projected
+
+
+MAX_DLQ_PROJECTION_BYTES: Final = 512 * 1024  # the DLQ copy must stay below the 1 MB limit
+
+
+def _minimal(projected: object) -> dict[str, object]:
+    """Envelope scalars and the job id only, for a projection too large to produce."""
+    if not isinstance(projected, dict):
+        return {}
+    document: dict[str, object] = projected  # pyright: ignore[reportUnknownVariableType]
+    head: dict[str, object] = {
+        key: value for key, value in document.items() if not isinstance(value, (dict, list))
+    }
+    data = document.get("data")
+    if isinstance(data, dict) and "job_id" in data:
+        head["data"] = {"job_id": data["job_id"]}
+    return head
+
+
+def _dump(document: dict[str, object]) -> bytes:
+    # ASCII escapes: a lone surrogate from the input must not break the diagnostic copy.
+    return json.dumps(document, ensure_ascii=True, separators=(",", ":"), allow_nan=False).encode()
 
 
 def dlq_value(raw: bytes | None) -> bytes | None:
     """DLQ copy for diagnostics. JSON is projected onto the contract's fields, so personal data
-    added by mistake does not live on in the DLQ for 14 days; non-JSON is kept as raw bytes."""
+    added by mistake does not live on in the DLQ for 14 days. Bytes that are not JSON (truncated,
+    wrong encoding) cannot be projected, so only their size and SHA-256 are kept."""
     if raw is None:
         return None
     try:
-        document: object = json.loads(raw)
+        document: object = json.loads(raw, parse_int=_parse_int)
     except ValueError, RecursionError:
-        return raw
-    # ASCII escapes: a lone surrogate from the input must not break the diagnostic copy.
-    projected = {"projected": _project(document, [BuildRequested])}
-    return json.dumps(projected, ensure_ascii=True, separators=(",", ":")).encode()
+        return _dump(
+            {"unparseable": True, "size_bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
+        )
+    projected = _project(document, [BuildRequested])
+    value = _dump({"projected": projected})
+    if len(value) > MAX_DLQ_PROJECTION_BYTES:
+        value = _dump({"projected": _minimal(projected), "truncated": True})
+    return value
 
 
 def dlq_message(message: InboundMessage, *, topic: str, error_class: str) -> OutboundMessage:

@@ -30,10 +30,6 @@ def _solve(p: Problem) -> Result:
     return result
 
 
-def _in_person(result: Result) -> set[tuple[str, int]]:
-    return {(f.class_id, f.day) for f in result.day_formats if f.in_person}
-
-
 def _one_class(
     capacity: Passport | AlertLimits, kind: TimetableKind = TimetableKind.MAIN
 ) -> Problem:
@@ -72,6 +68,30 @@ def test_model_1_1_vs_1_2_differ_by_seats() -> None:
     assert _solve(_one_class(AlertLimits(19, 1000), ALERT)).stats.objective == 0
 
 
+@pytest.mark.parametrize(
+    ("capacity", "kind"),
+    [
+        (Passport(2**64), TimetableKind.MAIN),
+        (AlertLimits(seats=2**63, passport=2**64), ALERT),
+    ],
+    ids=["1.1", "1.2"],
+)
+def test_capacity_beyond_int64_is_an_unlimited_shelter(
+    capacity: Passport | AlertLimits, kind: TimetableKind
+) -> None:
+    # CP-SAT takes int64 constants only: such limits must not crash the model build.
+    p = problem(
+        classes=(klass("a", 20),),
+        teachers=(teacher("t1"),),
+        rows=(row("a", PRIO, "t1", 2),),
+        capacity=capacity,
+        kind=kind,
+        days=(1,),
+        staff=2**63,
+    )
+    assert _solve(p).stats.objective == 40
+
+
 def test_teacher_with_several_in_person_lessons_is_counted_once() -> None:
     p = problem(
         classes=(klass("a", 20),),
@@ -93,7 +113,7 @@ def test_teacher_with_only_remote_lessons_is_not_counted() -> None:
     )
     result = _solve(p)
     assert result.stats.objective == 40
-    assert _in_person(result) == {("a", 1)}
+    assert oracle.in_person_days(result) == {("a", 1)}
 
 
 @pytest.mark.parametrize(("second", "objective"), [("t1", 0), ("t2", 20)], ids=["shared", "own"])
@@ -125,7 +145,7 @@ def test_no_shelter_only_on_remote_days_and_only_for_alert(
     result = _solve(p)
     assert result.stats.objective == objective
     if kind is ALERT:
-        in_person = _in_person(result)
+        in_person = oracle.in_person_days(result)
         assert all(
             (x.class_id, x.day) not in in_person for x in result.lessons if x.subject_id == OUTSIDE
         )
@@ -140,7 +160,7 @@ def test_empty_day_is_never_in_person() -> None:
     )
     result = _solve(p)
     assert result.stats.objective == 3 * 20 + 1  # one in-person day, not two
-    assert len(_in_person(result)) == 1
+    assert len(oracle.in_person_days(result)) == 1
 
 
 def test_class_priority_flag_only_breaks_ties() -> None:
@@ -152,7 +172,7 @@ def test_class_priority_flag_only_breaks_ties() -> None:
         days=(1,),
     )
     result = _solve(p)
-    assert _in_person(result) == {("b", 1)}  # 21 pupils beat the flag
+    assert oracle.in_person_days(result) == {("b", 1)}  # 21 pupils beat the flag
     assert result.stats.objective == 2 * 21
 
 

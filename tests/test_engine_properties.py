@@ -121,6 +121,36 @@ def test_alert_with_unlimited_seats_and_no_outside_subjects_equals_main(p: Probl
 
 
 @st.composite
+def alert_first(draw: st.DrawFn) -> Problem:
+    """A timetable-first problem as 1.2: seats may bind, and no-shelter rows stay (remote days).
+
+    "Everything remote" satisfies seats, passport >= staff and the no-shelter rule, so these
+    problems stay feasible by construction.
+    """
+    p = draw(timetable_first())
+    seats = draw(st.integers(0, sum(c.students for c in p.classes)))
+    return replace(
+        p,
+        kind=TimetableKind.ALERT,
+        capacity=AlertLimits(seats=seats, passport=p.capacity.passport),
+    )
+
+
+@SETTINGS
+@given(alert_first())
+def test_alert_problem_is_never_infeasible_and_respects_seats(p: Problem) -> None:
+    _optimal(p)  # the oracle checks seats, passport and no-shelter lessons on remote days
+
+
+@SETTINGS
+@given(alert_first(), st.integers(1, 40))
+def test_more_seats_never_lower_the_objective(p: Problem, extra: int) -> None:
+    assert isinstance(p.capacity, AlertLimits)
+    more = replace(p, capacity=replace(p.capacity, seats=p.capacity.seats + extra))
+    assert _objective(_optimal(more)) >= _objective(_optimal(p))
+
+
+@st.composite
 def day_loads(draw: st.DrawFn) -> tuple[int, list[DayDemand]]:
     """Loads of one day with class-day and teacher-day totals <= L (what phase A produces)."""
     lessons_per_day = draw(st.integers(1, 6))

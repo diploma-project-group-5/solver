@@ -7,6 +7,7 @@ commit and sets LAD_CONTRACTS_DIR, so there these tests always run.
 
 import json
 import os
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -55,6 +56,7 @@ from lad_solver.domain.result import (
     Result,
     SolveStatus,
     Stats,
+    StopReason,
 )
 from lad_solver.model.cpsat import SolverConfig, run
 from lad_solver.model.index import build_index
@@ -63,6 +65,11 @@ from lad_solver.model.phase_a import build_phase_a
 _DEFAULT = Path(__file__).resolve().parents[3] / "contracts"
 CONTRACTS = Path(os.environ.get("LAD_CONTRACTS_DIR", str(_DEFAULT)))
 SCHEMAS = CONTRACTS / "schemas" / "events"
+
+# CI sets LAD_CONTRACTS_DIR: there a moved or renamed layout must fail loudly, not skip.
+if "LAD_CONTRACTS_DIR" in os.environ and not SCHEMAS.is_dir():
+    msg = "LAD_CONTRACTS_DIR is set but the contracts layout is missing"
+    raise RuntimeError(msg)
 
 pytestmark = pytest.mark.skipif(
     not SCHEMAS.is_dir(),
@@ -141,6 +148,14 @@ def test_started_event_conforms() -> None:
         completed_data(
             UUID(JOB_ID), feasible_result(), Provenance(wall_time_ms=12, input_sha256="0" * 64)
         ),
+        completed_data(
+            UUID(JOB_ID),
+            replace(
+                feasible_result(),
+                stats=replace(feasible_result().stats, stop_reason=StopReason.NO_IMPROVEMENT),
+            ),
+            Provenance(wall_time_ms=9, input_sha256="0" * 64),
+        ),
         completed_data(UUID(JOB_ID), Result(status=SolveStatus.EXPIRED), None),
         rejected_data(UUID(JOB_ID), ErrorCode.INVALID_PAYLOAD),
         rejected_data(UUID(JOB_ID), ErrorCode.INTERNAL),
@@ -163,6 +178,7 @@ def test_started_event_conforms() -> None:
     ],
     ids=[
         "feasible",
+        "feasible-no-improvement",
         "expired",
         "invalid_payload",
         "internal",

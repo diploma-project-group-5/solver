@@ -23,6 +23,8 @@ type Id = Annotated[
     str, StringConstraints(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_.:-]+$")
 ]
 type Day = Annotated[int, Field(ge=1, le=6)]
+# Unbounded counts would pass validation and then overflow CP-SAT's int64 while the model is built.
+type Count = Annotated[int, Field(ge=0, le=2**63 - 1)]
 
 
 def _unique_days(days: tuple[int, ...]) -> tuple[int, ...]:
@@ -67,12 +69,12 @@ class EnvelopeHead(_Model):
 
 
 class PassportCapacity(_Model):
-    passport: Annotated[int, Field(ge=0)]
+    passport: Count
 
 
 class AlertCapacity(_Model):
-    seats: Annotated[int, Field(ge=0)]
-    passport: Annotated[int, Field(ge=0)]
+    seats: Count
+    passport: Count
 
 
 class ClassIn(_Model):
@@ -104,12 +106,12 @@ class BuildRequestedData(_Model):
     job_id: UUID
     kind: Literal["main", "alert"]
     model: Literal["1.1", "1.2"]
-    snapshot_version: Annotated[int, Field(ge=0)]
+    snapshot_version: Count
     time_limit_s: Annotated[int, Field(ge=1, le=3600)]
     queue_deadline_at: AwareDatetime
     school_days: Annotated[Days, Field(min_length=1)]
     lessons_per_day: Annotated[int, Field(ge=1, le=MAX_LESSONS_PER_DAY)]
-    staff: Annotated[int, Field(ge=0)]
+    staff: Count
     # Alert first: with extra='ignore' a {seats, passport} object would also match PassportCapacity.
     capacity: AlertCapacity | PassportCapacity
     classes: Annotated[tuple[ClassIn, ...], Field(max_length=MAX_CLASSES)]

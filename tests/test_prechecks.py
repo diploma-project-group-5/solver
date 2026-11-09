@@ -120,6 +120,13 @@ INVALID: list[tuple[str, Problem]] = [
     ("negative weekly limit", _base(teachers=(teacher("t1", -1),))),
     ("unavailable day outside 1..6", _base(teachers=(teacher("t1", 10, unavailable=(0,)),))),
     ("duplicate class id", _base(classes=(klass("a", 1), klass("a", 2)))),
+    ("negative passport (1.1)", _base(staff=0, capacity=Passport(-1))),
+    (
+        "negative passport (1.2)",
+        _base(staff=0, kind=TimetableKind.ALERT, capacity=AlertLimits(seats=0, passport=-1)),
+    ),
+    ("alert timetable with a 1.1 capacity", _base(kind=TimetableKind.ALERT)),
+    ("main timetable with a 1.2 capacity", _base(capacity=AlertLimits(seats=50, passport=100))),
 ]
 
 

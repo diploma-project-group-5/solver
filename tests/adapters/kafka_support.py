@@ -12,7 +12,12 @@ from pathlib import Path
 from typing import Any
 
 from lad_solver.adapters.kafka.config import WorkerConfig
-from lad_solver.adapters.kafka.ports import InboundMessage, OutboundMessage, TransientKafkaError
+from lad_solver.adapters.kafka.ports import (
+    FatalKafkaError,
+    InboundMessage,
+    OutboundMessage,
+    TransientKafkaError,
+)
 from lad_solver.adapters.kafka.worker import Worker
 from lad_solver.domain.problem import Params, Problem
 from lad_solver.domain.result import (
@@ -25,6 +30,7 @@ from lad_solver.domain.result import (
     Stats,
     StopReason,
 )
+from lad_solver.model.progress import Progress
 from lad_solver.model.stop import StopHandle
 
 NOW = datetime(2026, 11, 4, 10, 0, tzinfo=UTC)
@@ -173,6 +179,7 @@ def _label(message: OutboundMessage) -> str:
 class FakeProducer:
     journal: Journal
     fail_types: dict[str, int] = field(default_factory=dict[str, int])
+    fatal_types: set[str] = field(default_factory=set[str])  # labels whose send is fatal
     on_poll: Callable[[], None] | None = None
     sent: list[OutboundMessage] = field(default_factory=list[OutboundMessage])
     send_timeouts: list[tuple[str, float]] = field(default_factory=list[tuple[str, float]])
@@ -188,6 +195,9 @@ class FakeProducer:
         self.batches.append([_label(m) for m in messages])
         for message in messages:
             label = _label(message)
+            if label in self.fatal_types:
+                msg = "_FATAL"
+                raise FatalKafkaError(msg)
             if self.fail_types.get(label, 0) > 0:
                 self.fail_types[label] -= 1
                 self.journal.entries.append(f"send-failed:{label}")
@@ -226,7 +236,10 @@ class FakeEngine:
     calls: list[tuple[Problem, Params]] = field(default_factory=list[tuple[Problem, Params]])
     stop_seen: bool = False
 
-    def __call__(self, problem: Problem, params: Params, stop: StopHandle) -> Result:
+    def __call__(
+        self, problem: Problem, params: Params, stop: StopHandle, progress: Progress
+    ) -> Result:
+        del progress  # the fake never reports solutions
         self.calls.append((problem, params))
         self.journal.entries.append("solve")
         if self.ignore_stop is not None:

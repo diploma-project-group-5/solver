@@ -16,6 +16,11 @@ def test_new_solver_sets_the_memory_cap() -> None:
     )
 
 
+def test_new_solver_leaves_sigint_to_the_worker() -> None:
+    # CP-SAT's own SIGINT handler would replace the worker's graceful stop (and outlive the solve).
+    assert not new_solver(SolverConfig(time_limit_s=1)).parameters.catch_sigint_signal
+
+
 def test_every_engine_run_gets_the_memory_cap(monkeypatch: pytest.MonkeyPatch) -> None:
     seen: list[int | None] = []
     real = cpsat.new_solver

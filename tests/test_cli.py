@@ -10,11 +10,27 @@ import pytest
 
 import oracle
 from lad_solver.cli.generate import generate_problem
-from lad_solver.cli.io import problem_from_json, problem_to_json, read_json, result_from_json
+from lad_solver.cli.io import (
+    problem_from_json,
+    problem_to_json,
+    read_json,
+    result_from_json,
+    result_to_json,
+)
 from lad_solver.cli.main import main
 from lad_solver.domain.prechecks import precheck
 from lad_solver.domain.problem import AlertLimits, TimetableKind
-from lad_solver.domain.result import SolveStatus
+from lad_solver.domain.result import (
+    CapacityCondition,
+    Conflict,
+    ConflictRule,
+    DayFormat,
+    Lesson,
+    Result,
+    SolveStatus,
+    Stats,
+    StopReason,
+)
 
 
 def test_generate_then_solve_round_trip(tmp_path: Path) -> None:
@@ -35,6 +51,151 @@ def test_generate_then_solve_round_trip(tmp_path: Path) -> None:
 def test_problem_json_round_trip() -> None:
     problem = generate_problem(6, 0.5, seed=3, kind=TimetableKind.ALERT, saturday=True)
     assert problem_from_json(problem_to_json(problem)) == problem
+
+
+def test_result_json_round_trip() -> None:
+    result = Result(
+        status=SolveStatus.INFEASIBLE,
+        lessons=(Lesson("5-A", 1, 2, "math", "t1"),),
+        day_formats=(DayFormat("5-A", 1, in_person=True), DayFormat("5-A", 2, in_person=False)),
+        conflicts=(
+            Conflict(ConflictRule.STAFF_OVER_PASSPORT, day=3, condition=CapacityCondition.SEATS),
+            Conflict(ConflictRule.PACKING, teacher_id="t1", hint=True),
+        ),
+        stats=Stats(
+            objective=42,
+            best_bound=43.5,
+            primary=4,
+            secondary=2,
+            wall_time_s=1.25,
+            first_solution_s=0.5,
+            last_improvement_s=0.75,
+            phase_a_status="FEASIBLE",
+            quality_relaxed=True,
+            stop_reason=StopReason.NO_IMPROVEMENT,
+            num_workers=2,
+            random_seed=7,
+        ),
+    )
+    assert result_from_json(result_to_json(result)) == result
+
+
+@pytest.mark.parametrize(
+    ("kind", "capacity"),
+    [("main", {"seats": 10, "passport": 20}), ("alert", {"passport": 20})],
+)
+def test_capacity_shape_must_match_kind(kind: str, capacity: dict[str, int]) -> None:
+    data = problem_to_json(generate_problem(2, 0.5, seed=1))
+    data["kind"] = kind
+    data["capacity"] = capacity
+    with pytest.raises(ValueError, match="capacity"):
+        problem_from_json(data)
+
+
+def test_conflict_hint_must_be_a_boolean() -> None:
+    data = result_to_json(
+        Result(SolveStatus.INFEASIBLE, conflicts=(Conflict(ConflictRule.PACKING),))
+    )
+    conflicts = data["conflicts"]
+    assert isinstance(conflicts, list)
+    conflicts[0]["hint"] = "yes"
+    with pytest.raises(TypeError, match="hint"):
+        result_from_json(data)
+
+
+def _problem_file(tmp_path: Path) -> Path:
+    path = tmp_path / "problem.json"
+    assert main(["generate", "--classes", "2", "--shelter-ratio", "0.5", "--out", str(path)]) == 0
+    return path
+
+
+def _bad_inputs(tmp_path: Path) -> dict[str, Path]:
+    invalid = tmp_path / "invalid.json"
+    invalid.write_text("{not json", encoding="utf-8")
+    wrong_type = tmp_path / "wrong_type.json"
+    data = json.loads(_problem_file(tmp_path).read_text(encoding="utf-8"))
+    data["lessons_per_day"] = "seven"
+    wrong_type.write_text(json.dumps(data), encoding="utf-8")
+    return {"missing": tmp_path / "missing.json", "invalid": invalid, "wrong_type": wrong_type}
+
+
+@pytest.mark.parametrize("case", ["missing", "invalid", "wrong_type"])
+def test_solve_rejects_bad_input_with_a_message(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], case: str
+) -> None:
+    source = _bad_inputs(tmp_path)[case]
+    capsys.readouterr()
+    assert main(["solve", "--in", str(source), "--out", str(tmp_path / "r.json")]) == 2
+    err = capsys.readouterr().err
+    assert err.startswith("lad-solver solve: ")
+    assert "Traceback" not in err
+
+
+@pytest.mark.parametrize("command", ["solve", "generate"])
+def test_missing_output_directory_is_rejected_up_front(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], command: str
+) -> None:
+    out = str(tmp_path / "nope" / "out.json")
+    argv = (
+        ["solve", "--in", str(_problem_file(tmp_path)), "--out", out]
+        if command == "solve"
+        else ["generate", "--classes", "2", "--shelter-ratio", "0.5", "--out", out]
+    )
+    capsys.readouterr()
+    assert main(argv) == 2
+    assert "output directory does not exist" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("option", "value"),
+    [
+        ("--time-limit", "0"),
+        ("--time-limit", "-1"),
+        ("--time-limit", "nan"),
+        ("--time-limit", "inf"),
+        ("--time-limit", "abc"),
+        ("--deterministic-time", "0"),
+        ("--deterministic-time", "nan"),
+        ("--workers", "0"),
+        ("--workers", "-2"),
+        ("--workers", "1.5"),
+    ],
+)
+def test_solve_rejects_out_of_range_options(tmp_path: Path, option: str, value: str) -> None:
+    argv = ["solve", "--in", str(tmp_path / "p.json"), "--out", str(tmp_path / "r.json")]
+    with pytest.raises(SystemExit) as exc:
+        main([*argv, option, value])
+    assert exc.value.code == 2
+
+
+@pytest.mark.parametrize("ratio", ["nan", "inf", "-0.1"])
+def test_generate_rejects_bad_shelter_ratio_option(tmp_path: Path, ratio: str) -> None:
+    argv = ["generate", "--classes", "2", "--shelter-ratio", ratio, "--out", str(tmp_path / "p")]
+    with pytest.raises(SystemExit) as exc:
+        main(argv)
+    assert exc.value.code == 2
+
+
+def test_generate_rejects_zero_classes_with_a_message(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    argv = ["generate", "--classes", "0", "--shelter-ratio", "0.5", "--out", str(tmp_path / "p")]
+    assert main(argv) == 2
+    assert capsys.readouterr().err.startswith("lad-solver generate: classes must be >= 1")
+
+
+def test_unwritable_output_is_reported(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    out = tmp_path / "taken"
+    out.mkdir()  # a directory where the file should go: write_text raises IsADirectoryError
+    argv = ["generate", "--classes", "2", "--shelter-ratio", "0.5", "--out", str(out)]
+    assert main(argv) == 2
+    assert capsys.readouterr().err.startswith("lad-solver generate: ")
+
+
+@pytest.mark.parametrize("ratio", [float("nan"), float("inf"), -0.1])
+def test_generate_problem_rejects_bad_shelter_ratio(ratio: float) -> None:
+    with pytest.raises(ValueError, match="shelter_ratio"):
+        generate_problem(2, ratio)
 
 
 def test_generator_is_deterministic_and_passes_prechecks() -> None:

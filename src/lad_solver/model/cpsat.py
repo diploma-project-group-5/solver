@@ -1,11 +1,11 @@
-"""Thin, typed wrapper around one CpSolver run: parameters, stop handle, first-solution time."""
+"""Thin, typed wrapper around one CpSolver run: parameters, stop handle, progress."""
 
-import time
 from dataclasses import dataclass, replace
 
 from ortools.sat.python import cp_model
 
 from lad_solver.domain.result import SolveStatus
+from lad_solver.model.progress import Progress
 from lad_solver.model.stop import StopHandle
 
 _STATUS = {
@@ -33,19 +33,18 @@ class SolverConfig:
 @dataclass(frozen=True, slots=True)
 class RunInfo:
     status: SolveStatus
-    wall_time_s: float
-    first_solution_at: float | None  # time.monotonic() of the first solution
     best_bound: float | None
 
 
-class _FirstSolution(cp_model.CpSolverSolutionCallback):
-    def __init__(self) -> None:
+class _Solutions(cp_model.CpSolverSolutionCallback):
+    """Reports every solution of a phase A run (a model with an objective) to ``progress``."""
+
+    def __init__(self, progress: Progress) -> None:
         super().__init__()
-        self.at: float | None = None
+        self._progress = progress
 
     def on_solution_callback(self) -> None:
-        if self.at is None:
-            self.at = time.monotonic()
+        self._progress.record(self.objective_value)
 
 
 def new_solver(config: SolverConfig) -> cp_model.CpSolver:
@@ -56,6 +55,9 @@ def new_solver(config: SolverConfig) -> cp_model.CpSolver:
     params.random_seed = config.random_seed
     params.log_search_progress = False
     params.log_to_stdout = False
+    # CP-SAT's own SIGINT handler would abort the worker mid-solve and stay installed after it;
+    # the worker owns SIGINT/SIGTERM and stops a solve through StopHandle.
+    params.catch_sigint_signal = False
     if config.max_deterministic_time is not None:
         params.max_deterministic_time = config.max_deterministic_time
     if config.interleave_search:
@@ -71,20 +73,31 @@ def run(
     stop: StopHandle | None = None,
     *,
     has_objective: bool = True,
+    progress: Progress | None = None,
 ) -> tuple[cp_model.CpSolver, RunInfo]:
-    """Solve ``model``; an already requested stop returns UNKNOWN without searching."""
+    """Solve ``model``; an already requested stop returns UNKNOWN without searching.
+
+    With ``progress`` (phase A, always a model with an objective), solutions are reported to it
+    and its stall check may stop this solver; ``StopHandle`` stays reserved for the external stop.
+    """
+    if progress is not None and not has_objective:
+        msg = "progress tracks the objective: a model without one cannot report to it"
+        raise ValueError(msg)
     solver = new_solver(config)
-    if stop is not None and stop.stopped:
-        return solver, RunInfo(SolveStatus.UNKNOWN, 0.0, None, None)
-    started = time.monotonic()
-    callback = _FirstSolution()
+    if (stop is not None and stop.stopped) or (progress is not None and progress.stalled):
+        return solver, RunInfo(SolveStatus.UNKNOWN, None)
+    callback = None if progress is None else _Solutions(progress)
     if stop is not None:
         stop.attach(solver)
+    if progress is not None:
+        progress.attach(solver)
     try:
         status = _STATUS[solver.solve(model, callback)]
     finally:
+        if progress is not None:
+            progress.detach()
         if stop is not None:
             stop.detach()
     found = status in {SolveStatus.OPTIMAL, SolveStatus.FEASIBLE}
     bound = solver.best_objective_bound if found and has_objective else None
-    return solver, RunInfo(status, time.monotonic() - started, callback.at, bound)
+    return solver, RunInfo(status, bound)
