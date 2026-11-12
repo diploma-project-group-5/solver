@@ -5,12 +5,16 @@ import importlib
 import math
 import sys
 from collections.abc import Callable, Sequence
+from importlib.metadata import version
 from pathlib import Path
 
 from lad_solver import __version__
+from lad_solver.adapters.kafka.mapping import MODEL_VERSION
 from lad_solver.app.solve import solve
 from lad_solver.cli.generate import generate_problem
 from lad_solver.cli.io import (
+    Json,
+    canonical_sha256,
     problem_from_json,
     problem_to_json,
     read_json,
@@ -129,8 +133,10 @@ def _solve(args: argparse.Namespace) -> int:
         interleave_search=args.interleave,
     )
     result = solve(problem, params)
+    output = result_to_json(result)
+    output["provenance"] = _provenance(read_json(args.input), params)
     try:
-        write_json(args.out, result_to_json(result))
+        write_json(args.out, output)
     except OSError as exc:
         return _fail("solve", exc)
     stats = result.stats
@@ -139,6 +145,23 @@ def _solve(args: argparse.Namespace) -> int:
         f"wall={stats.wall_time_s:.1f}s relaxed={stats.quality_relaxed}\n"
     )
     return 0
+
+
+def _provenance(problem: Json, params: Params) -> Json:
+    """Enough to reproduce a committed result: versions, the input hash and the solver knobs."""
+    return {
+        "solver_version": __version__,
+        "model_version": MODEL_VERSION,
+        "ortools_version": version("ortools"),
+        "input_sha256": canonical_sha256(problem),
+        "params": {
+            "time_limit_s": params.time_limit_s,
+            "max_deterministic_time": params.max_deterministic_time,
+            "num_workers": params.num_workers,
+            "random_seed": params.random_seed,
+            "interleave_search": params.interleave_search,
+        },
+    }
 
 
 def _generate(args: argparse.Namespace) -> int:
