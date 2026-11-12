@@ -4,13 +4,17 @@ import importlib
 import json
 import types
 from collections import Counter
+from importlib.metadata import version
 from pathlib import Path
 
 import pytest
 
+import lad_solver
 import oracle
+from lad_solver.adapters.kafka.mapping import MODEL_VERSION
 from lad_solver.cli.generate import generate_problem
 from lad_solver.cli.io import (
+    canonical_sha256,
     problem_from_json,
     problem_to_json,
     read_json,
@@ -46,6 +50,42 @@ def test_generate_then_solve_round_trip(tmp_path: Path) -> None:
     assert oracle.violations(problem, result) == []
     assert result.stats.objective == oracle.objective(problem, result).value
     assert json.loads(result_path.read_text(encoding="utf-8"))["status"] == result.status.value
+
+
+def test_solve_writes_provenance(tmp_path: Path) -> None:
+    problem_path = _problem_file(tmp_path)
+    result_path = tmp_path / "result.json"
+    assert main(["solve", "--in", str(problem_path), "--out", str(result_path),
+                 "--time-limit", "10", "--workers", "1", "--seed", "3",
+                 "--deterministic-time", "5"]) == 0  # fmt: skip
+
+    provenance = json.loads(result_path.read_text(encoding="utf-8"))["provenance"]
+    assert provenance == {
+        "solver_version": lad_solver.__version__,
+        "model_version": MODEL_VERSION,
+        "ortools_version": version("ortools"),
+        "input_sha256": canonical_sha256(read_json(problem_path)),
+        "params": {
+            "time_limit_s": 10.0,
+            "max_deterministic_time": 5.0,
+            "num_workers": 1,
+            "random_seed": 3,
+            "interleave_search": False,
+        },
+    }
+    # The provenance does not change how the result itself parses back.
+    assert result_from_json(read_json(result_path)).status in {
+        SolveStatus.OPTIMAL,
+        SolveStatus.FEASIBLE,
+    }
+
+
+def test_input_hash_ignores_key_order_and_whitespace() -> None:
+    data = problem_to_json(generate_problem(2, 0.5, seed=1))
+    reordered = json.loads(json.dumps(dict(reversed(list(data.items()))), indent=3))
+    assert canonical_sha256(reordered) == canonical_sha256(data)
+    changed = {**data, "staff": 999}
+    assert canonical_sha256(changed) != canonical_sha256(data)
 
 
 def test_problem_json_round_trip() -> None:
