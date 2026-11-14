@@ -1,4 +1,4 @@
-"""Phase B: lesson numbers for one day (ADR 2026-11-04 §1).
+"""Phase B: lesson numbers for one day (ADR 2026-11-04 §1; objective: ADR 2026-11-14 no gaps).
 
 Given the day loads of phase A (class-day and teacher-day <= L) a clash-free assignment always
 exists (König). The soft objective is lexicographic per class with k_c lessons: first no gaps
