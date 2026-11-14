@@ -34,6 +34,10 @@ PHASE_B_RESERVE_SHARE = 0.15
 PHASE_B_DAY_MAX_S = 5.0
 # Per day, feasibility only and not interruptible: a timed-out or stopped day still gets a grid.
 PHASE_B_RETRY_S = 2.0
+# With params.max_deterministic_time set, phase B days get these deterministic budgets instead of
+# wall-clock ones (same magnitudes), so a seeded result does not depend on the machine.
+PHASE_B_DAY_DET = PHASE_B_DAY_MAX_S
+PHASE_B_RETRY_DET = PHASE_B_RETRY_S
 BUSY_TEACHER_LOAD = 0.9
 BUSY_TEACHERS_MAX = 3
 
@@ -89,7 +93,8 @@ def solve(
         return _no_plan(index, params, started, a, stopped=stopped)
 
     day_limit = min(PHASE_B_DAY_MAX_S, reserve_b / len(problem.school_days))
-    lessons = _run_phase_b(index, a.plan, params, stop, day_limit)
+    end = started + params.time_limit_s
+    lessons = _run_phase_b(index, a.plan, params, stop, day_limit, end=end)
     sc = score(index, a.plan)
     stats = _stats(
         params,
@@ -175,7 +180,10 @@ def _phase_a_ladder(
     probe = solve_phase_a(
         index,
         caps,
-        base.with_time(PROBE_SHARE * budget, _share(det, PROBE_SHARE)),
+        # A deterministic budget splits the work; the wall clock is then just the safety net.
+        base.with_time(
+            budget if det is not None else PROBE_SHARE * budget, _share(det, PROBE_SHARE)
+        ),
         stop,
         progress=progress,
     )
@@ -253,8 +261,14 @@ def _packing_conflicts(index: Index) -> tuple[Conflict, ...]:
     return (Conflict(ConflictRule.PACKING), *busiest)
 
 
-def _run_phase_b(
-    index: Index, plan: DayPlan, params: Params, stop: StopHandle | None, day_limit: float
+def _run_phase_b(  # noqa: PLR0913 - keyword-only overall deadline
+    index: Index,
+    plan: DayPlan,
+    params: Params,
+    stop: StopHandle | None,
+    day_limit: float,
+    *,
+    end: float,
 ) -> tuple[Lesson, ...] | SolveStatus:
     """All lessons, or the status of the first day that got no assignment."""
     rows = index.problem.rows
@@ -268,7 +282,7 @@ def _run_phase_b(
         if not demands:
             continue
         assigned = _assign_day(
-            day, demands, index.lessons_per_day, params, stop=stop, limit=day_limit
+            day, demands, index.lessons_per_day, params, stop=stop, limit=day_limit, end=end
         )
         if assigned.periods is None:
             return assigned.status
@@ -288,11 +302,15 @@ def _assign_day(  # noqa: PLR0913 - keyword-only stop/limit
     *,
     stop: StopHandle | None,
     limit: float,
+    end: float,
 ) -> DayAssignment:
     """Compact model within ``limit``; on timeout (or stop) one feasibility-only retry.
 
-    At most two CP-SAT runs per day (``fallback=False``): ``limit + PHASE_B_RETRY_S``.
+    At most two CP-SAT runs per day (``fallback=False``): ``limit + PHASE_B_RETRY_S``. With a
+    deterministic budget the runs get ``PHASE_B_DAY_DET`` / ``PHASE_B_RETRY_DET`` instead, and the
+    wall clock only stops them at the overall deadline ``end`` (``time.monotonic()``).
     """
+    deterministic = params.max_deterministic_time is not None
     config = SolverConfig(
         time_limit_s=limit,
         num_workers=params.num_workers,
@@ -300,11 +318,17 @@ def _assign_day(  # noqa: PLR0913 - keyword-only stop/limit
         interleave_search=params.interleave_search,
         max_memory_mb=params.max_memory_mb,
     )
+    if deterministic:
+        config = config.with_time(_remaining(end), PHASE_B_DAY_DET)
     if not _is_stopped(stop):
         first = assign_day(day, demands, lessons_per_day, config=config, stop=stop, fallback=False)
         if first.periods is not None or first.status is not SolveStatus.UNKNOWN:
             return first  # found, or a proven failure that a retry cannot fix
-    retry = config.with_time(PHASE_B_RETRY_S)
+    retry = (
+        config.with_time(_remaining(end), PHASE_B_RETRY_DET)
+        if deterministic
+        else config.with_time(PHASE_B_RETRY_S)
+    )
     return assign_day(day, demands, lessons_per_day, config=retry, compact=False)
 
 
