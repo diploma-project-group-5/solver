@@ -252,7 +252,8 @@ def to_problem(data: BuildRequestedData) -> Problem:
         ):
             msg = "curriculum row references an unknown id"
             raise InvalidInputError(msg)
-    _unique("row", [f"{r.class_id}\x00{r.subject_id}\x00{r.teacher_id}" for r in data.rows])
+    # One teacher per class x subject (spec), as validator-lib duplicate_row: no teacher in key.
+    _unique("row", [f"{r.class_id}\x00{r.subject_id}" for r in data.rows])
 
     capacity = (
         AlertLimits(seats=data.capacity.seats, passport=data.capacity.passport)
