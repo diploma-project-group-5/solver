@@ -6,12 +6,14 @@ construction: INFEASIBLE from the engine would be a bug.
 
 from collections import Counter
 from dataclasses import replace
+from unittest import mock
 
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
 import golden
 from builders import OTHER, OUTSIDE, PRIO, klass, problem, row, teacher
+from lad_solver.app import solve as solve_module
 from lad_solver.app.solve import solve
 from lad_solver.domain.problem import (
     AlertLimits,
@@ -125,6 +127,29 @@ def test_alert_with_unlimited_seats_and_no_outside_subjects_equals_main(p: Probl
         capacity=AlertLimits(seats=10**6, passport=p.capacity.passport),
     )
     assert _objective(_optimal(alert)) == _objective(_optimal(main))
+
+
+def _no_classes(*_args: object) -> list[str]:
+    return []
+
+
+@SETTINGS
+@given(timetable_first())
+def test_coverage_step_keeps_the_phase_a_objective_and_status(p: Problem) -> None:
+    """The coverage step (ADR 2026-11-14) never trades the objective for in-person days."""
+    final = _optimal(p)
+    # Phase A alone, as before the coverage step: no time reserve and no second run.
+    with (
+        mock.patch.object(solve_module, "static_orphans", _no_classes),
+        mock.patch.object(solve_module, "zero_day_classes", _no_classes),
+    ):
+        step1 = _optimal(p)
+    assert final.status is step1.status
+    assert _objective(final) >= _objective(step1)
+    # Step 1 is OPTIMAL here, so its objective is the optimum V*: the floor keeps exactly it.
+    assert _objective(final) == _objective(step1)
+    zero_day = golden.classes_without_in_person_days
+    assert len(zero_day(p, final)) <= len(zero_day(p, step1))
 
 
 @st.composite

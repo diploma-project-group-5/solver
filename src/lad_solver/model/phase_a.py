@@ -4,6 +4,9 @@ Variables: ``y[r,d]`` lessons of row r on day d; ``f[c,d]`` class c is in person
 ``z[t,d]`` teacher t is on site; ``b[c,t,d]`` the pair (c,t) has lessons on d; ``q[c,d]`` priority
 lessons of c held in person on d. Lesson numbers are left to phase B, which is always feasible
 because class-day and teacher-day loads are <= L (König's edge-colouring theorem).
+
+The coverage step (ADR 2026-11-14) re-solves the same model with the objective turned into a
+floor and ``max sum(h_c)`` as the goal, ``h_c`` = class c has at least one in-person day.
 """
 
 import time
@@ -22,6 +25,8 @@ MIN_RUN_S = 0.05  # floor of a search budget, even past the deadline
 
 type RowDay = tuple[int, int]  # (row position, day)
 type ClassDay = tuple[int, int]  # (class position, day)
+
+_FOUND = frozenset({SolveStatus.OPTIMAL, SolveStatus.FEASIBLE})
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +65,8 @@ class PhaseAModel:
     q: dict[ClassDay, tuple[cp_model.IntVar, int, tuple[int, ...]]] = field(
         default_factory=dict[ClassDay, tuple[cp_model.IntVar, int, tuple[int, ...]]]
     )
+    # W * sum(N_c * q) + sum(f of flagged classes), every term >= 0; the coverage floor bounds it
+    objective: cp_model.LinearExprT = 0
 
 
 def score(index: Index, plan: DayPlan) -> Score:
@@ -71,6 +78,42 @@ def score(index: Index, plan: DayPlan) -> Score:
             primary += index.students[c] * n
     secondary = sum(1 for c, _ in plan.in_person if index.class_priority[c])
     return Score(primary, secondary, index.weight * primary + secondary)
+
+
+def zero_day_classes(index: Index, plan: DayPlan) -> list[str]:
+    """Classes that could be in person but have no in-person day in ``plan`` (ids, input order)."""
+    covered = {c for c, _ in plan.in_person}
+    return [index.problem.classes[c].id for c in _coverable(index) if c not in covered]
+
+
+def static_orphans(index: Index) -> list[str]:
+    """Coverable classes whose in-person days no objective term rewards, known before any search.
+
+    No flag (secondary) and ``m_c == 0`` (primary): no priority lesson, or no pupils to weigh it.
+    Phase A leaves their formats to chance (ADR 2026-11-14).
+    """
+    return [
+        index.problem.classes[c].id
+        for c in _coverable(index)
+        if not index.class_priority[c] and not _earns_primary(index, c)
+    ]
+
+
+def _earns_primary(index: Index, c: int) -> bool:
+    """``m_c > 0`` and pupils to weigh it: some in-person day of c adds to the primary term."""
+    rows = index.rows_by_class[c]
+    return index.students[c] > 0 and any(
+        index.row_priority[r] and index.row_hours[r] > 0 for r in rows
+    )
+
+
+def _coverable(index: Index) -> list[int]:
+    """Classes with a lesson that may be held in person (not only no-shelter lessons of 1.2)."""
+    return [
+        c
+        for c, rows in enumerate(index.rows_by_class)
+        if any(index.row_hours[r] > 0 and not index.row_outside[r] for r in rows)
+    ]
 
 
 def solve_phase_a(  # noqa: PLR0913 - keyword-only hint/progress/deadline
@@ -85,15 +128,62 @@ def solve_phase_a(  # noqa: PLR0913 - keyword-only hint/progress/deadline
 ) -> PhaseAOutcome:
     """``deadline`` (``time.monotonic()``): the search gets what is left after model building."""
     built = build_phase_a(index, caps, hint)
-    if deadline is not None:
-        left = max(deadline - time.monotonic(), MIN_RUN_S)
-        config = config.with_time(left, config.max_deterministic_time)
-    solver, info = run(built.model, config, stop, progress=progress)
-    if info.status not in {SolveStatus.OPTIMAL, SolveStatus.FEASIBLE}:
-        return PhaseAOutcome(info, None)
+    solver, info = run(built.model, _until(config, deadline), stop, progress=progress)
+    return PhaseAOutcome(info, _plan(built, solver) if info.status in _FOUND else None)
+
+
+def solve_coverage(  # noqa: PLR0913 - keyword-only stop/deadline
+    index: Index,
+    caps: tuple[int, ...],
+    plan: DayPlan,
+    floor: int,
+    config: SolverConfig,
+    *,
+    stop: StopHandle | None = None,
+    deadline: float | None = None,
+) -> PhaseAOutcome:
+    """Coverage step: most classes with an in-person day while the objective stays >= ``floor``.
+
+    ``plan`` (a solution under the same ``caps``, whose objective is ``floor``) is the hint, so
+    the search starts from a feasible point. No ``Progress``: this objective has another scale and
+    must not feed the no-improvement rule of phase A (ADR 2026-11-08); ``stop`` still applies.
+    """
+    built = build_coverage(index, caps, plan, floor)
+    solver, info = run(built.model, _until(config, deadline), stop)
+    return PhaseAOutcome(info, _plan(built, solver) if info.status in _FOUND else None)
+
+
+def build_coverage(index: Index, caps: tuple[int, ...], plan: DayPlan, floor: int) -> PhaseAModel:
+    """Phase A constraints + ``objective >= floor``; maximise ``sum(h_c)``, ``h_c <= sum_d f``."""
+    m = build_phase_a(index, caps, hint=plan)
+    if floor > 0:  # every objective term is >= 0, so a floor of 0 holds anyway
+        m.model.add(m.objective >= floor).with_name("objective_floor")
+    covered = {c for c, _ in plan.in_person}
+    has_day: list[cp_model.IntVar] = []
+    for c in _coverable(index):
+        days = [m.f[c, d] for d in index.days if (c, d) in m.f]
+        if not days:
+            continue
+        h = m.model.new_bool_var(f"h_{c}")
+        m.model.add(h <= sum(days))
+        m.model.add_hint(h, int(c in covered))
+        has_day.append(h)
+    m.model.maximize(sum(has_day))
+    return m
+
+
+def _until(config: SolverConfig, deadline: float | None) -> SolverConfig:
+    """``deadline`` (``time.monotonic()``): the search gets what is left after model building."""
+    if deadline is None:
+        return config
+    left = max(deadline - time.monotonic(), MIN_RUN_S)
+    return config.with_time(left, config.max_deterministic_time)
+
+
+def _plan(built: PhaseAModel, solver: cp_model.CpSolver) -> DayPlan:
     loads = {k: v for k, var in built.y.items() if (v := int(solver.value(var))) > 0}
     in_person = frozenset(k for k, var in built.f.items() if solver.boolean_value(var))
-    return PhaseAOutcome(info, DayPlan(loads, in_person))
+    return DayPlan(loads, in_person)
 
 
 def build_phase_a(index: Index, caps: tuple[int, ...], hint: DayPlan | None = None) -> PhaseAModel:
@@ -202,7 +292,8 @@ def _add_objective(m: PhaseAModel, index: Index, caps: tuple[int, ...]) -> None:
         if index.class_priority[c]:
             terms.append(f)
             coefficients.append(1)
-    m.model.maximize(sum(k * v for v, k in zip(terms, coefficients, strict=True)))
+    m.objective = sum(k * v for v, k in zip(terms, coefficients, strict=True))
+    m.model.maximize(m.objective)
 
 
 def _priority_in_person(

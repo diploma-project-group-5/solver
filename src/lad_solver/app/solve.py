@@ -1,10 +1,12 @@
 """Use case: build a main (1.1) or alert (1.2) timetable. The single entry point of the engine.
 
 Flow (ADR 2026-11-04 §1-§3): pre-checks -> phase A (days, formats, capacity, objective) with a
-quality ladder -> phase B (lesson numbers, one small model per day) -> ``Result``.
+quality ladder -> coverage step (ADR 2026-11-14: more classes with an in-person day, the phase A
+objective kept) -> phase B (lesson numbers, one small model per day) -> ``Result``.
 The time limit covers everything; phase B keeps a reserve of ``min(15 s, 0.15 T)``.
 """
 
+import logging
 import time
 from collections import Counter
 from dataclasses import dataclass, replace
@@ -23,12 +25,28 @@ from lad_solver.domain.result import (
 )
 from lad_solver.model.cpsat import SolverConfig
 from lad_solver.model.index import Index, build_index
-from lad_solver.model.phase_a import MIN_RUN_S, DayPlan, PhaseAOutcome, score, solve_phase_a
+from lad_solver.model.phase_a import (
+    MIN_RUN_S,
+    DayPlan,
+    PhaseAOutcome,
+    score,
+    solve_coverage,
+    solve_phase_a,
+    static_orphans,
+    zero_day_classes,
+)
 from lad_solver.model.phase_b import DayAssignment, DayDemand, assign_day
 from lad_solver.model.progress import Progress, StallPolicy
 from lad_solver.model.stop import StopHandle
 
+_log = logging.getLogger(__name__)
+
 PROBE_SHARE = 0.25  # no phase A solution within this share of its budget -> drop the row cap
+# Coverage step (ADR 2026-11-14). Only when some class can never earn an objective reward (static
+# orphans) does it get a reserve of min(10 s, 0.15 of the phase A budget) taken from the ladder,
+# or 0.15 of max_deterministic_time; otherwise it runs on what the ladder leaves.
+COVERAGE_MAX_S = 10.0
+COVERAGE_SHARE = 0.15
 PHASE_B_RESERVE_MAX_S = 15.0
 PHASE_B_RESERVE_SHARE = 0.15
 PHASE_B_DAY_MAX_S = 5.0
@@ -50,10 +68,17 @@ class _PhaseA:
     plan: DayPlan | None
     best_bound: float | None
     relaxed: bool
+    caps: tuple[int, ...]  # row-day caps of the run reported here (the coverage step keeps them)
     note: str | None = None  # anomaly worth seeing in Stats.phase_a_status
     stalled: bool = False  # stopped by the no-improvement rule (ADR 2026-11-08)
     first_solution_at: float | None = None  # time.monotonic(), from Progress
     last_improvement_at: float | None = None  # time.monotonic(), from Progress
+
+
+@dataclass(frozen=True, slots=True)
+class _Budget:
+    deadline: float  # time.monotonic()
+    det: float | None  # max_deterministic_time of the runs; None = wall clock only
 
 
 def solve(
@@ -137,7 +162,11 @@ def _run_phase_a(
     *,
     deadline: float,
 ) -> _PhaseA:
-    """One clock for every phase A run; the no-improvement rule stops whichever is running."""
+    """One clock for every ladder run; the no-improvement rule stops whichever is running.
+
+    The coverage step runs once that clock has finished: its objective has another scale.
+    """
+    ladder, coverage = _coverage_budgets(index, params, deadline)
     policy = (
         None
         if params.stall_min_s is None
@@ -145,14 +174,36 @@ def _run_phase_a(
     )
     progress.begin(policy)
     try:
-        a = _phase_a_ladder(index, params, stop, progress, deadline=deadline)
+        a = _phase_a_ladder(index, params, stop, progress, budget=ladder)
     finally:
         stalled = progress.finish()
-    return replace(
+    a = replace(
         a,
         stalled=stalled,
         first_solution_at=progress.first_solution_at,
         last_improvement_at=progress.last_improvement_at,
+    )
+    return _cover(index, a, params, stop, coverage)
+
+
+def _coverage_budgets(index: Index, params: Params, deadline: float) -> tuple[_Budget, _Budget]:
+    """(ladder, coverage step). The ladder gives up a reserve only for static orphans."""
+    det = params.max_deterministic_time
+    coverage = _Budget(deadline, _share(det, COVERAGE_SHARE))
+    if not static_orphans(index):
+        return _Budget(deadline, det), coverage
+    reserve = min(COVERAGE_MAX_S, COVERAGE_SHARE * max(deadline - time.monotonic(), 0.0))
+    return _Budget(deadline - reserve, _share(det, 1 - COVERAGE_SHARE)), coverage
+
+
+def _config(params: Params, time_limit_s: float, det: float | None = None) -> SolverConfig:
+    return SolverConfig(
+        time_limit_s=time_limit_s,
+        num_workers=params.num_workers,
+        random_seed=params.random_seed,
+        max_deterministic_time=det,
+        interleave_search=params.interleave_search,
+        max_memory_mb=params.max_memory_mb,
     )
 
 
@@ -162,19 +213,12 @@ def _phase_a_ladder(
     stop: StopHandle | None,
     progress: Progress,
     *,
-    deadline: float,
+    budget: _Budget,
 ) -> _PhaseA:
     """Capped model; if it is proven infeasible or finds nothing in the probe -> uncapped."""
-    started = time.monotonic()
-    budget = max(deadline - started, MIN_RUN_S)
-    base = SolverConfig(
-        time_limit_s=budget,
-        num_workers=params.num_workers,
-        random_seed=params.random_seed,
-        interleave_search=params.interleave_search,
-        max_memory_mb=params.max_memory_mb,
-    )
-    det = params.max_deterministic_time
+    deadline, det = budget.deadline, budget.det
+    seconds = max(deadline - time.monotonic(), MIN_RUN_S)
+    base = _config(params, seconds)
     caps = index.row_caps(params.row_day_cap_min, relaxed=False)
     # The probe keeps its fixed share; later runs get what is left after building their model.
     probe = solve_phase_a(
@@ -182,7 +226,7 @@ def _phase_a_ladder(
         caps,
         # A deterministic budget splits the work; the wall clock is then just the safety net.
         base.with_time(
-            budget if det is not None else PROBE_SHARE * budget, _share(det, PROBE_SHARE)
+            seconds if det is not None else PROBE_SHARE * seconds, _share(det, PROBE_SHARE)
         ),
         stop,
         progress=progress,
@@ -190,11 +234,13 @@ def _phase_a_ladder(
     rest = base.with_time(_remaining(deadline), _share(det, 1 - PROBE_SHARE))
     if probe.plan is not None:
         if probe.info.status is SolveStatus.OPTIMAL or _is_stopped(stop) or progress.stalled:
-            return _PhaseA(probe.info.status, probe.plan, probe.info.best_bound, relaxed=False)
+            return _PhaseA(
+                probe.info.status, probe.plan, probe.info.best_bound, relaxed=False, caps=caps
+            )
         follow = solve_phase_a(
             index, caps, rest, stop, hint=probe.plan, progress=progress, deadline=deadline
         )
-        return _better(index, probe, probe.plan, follow)
+        return _better(index, caps, probe, probe.plan, follow)
     if _is_stopped(stop):
         # INFEASIBLE here is a proof for the capped model only: the relaxed run never started.
         status = (
@@ -202,12 +248,18 @@ def _phase_a_ladder(
             if probe.info.status is SolveStatus.INFEASIBLE
             else probe.info.status
         )
-        return _PhaseA(status, None, None, relaxed=False)
+        return _PhaseA(status, None, None, relaxed=False, caps=caps)
     if probe.info.status not in {SolveStatus.INFEASIBLE, SolveStatus.UNKNOWN}:
-        return _PhaseA(probe.info.status, None, None, relaxed=False)
+        return _PhaseA(probe.info.status, None, None, relaxed=False, caps=caps)
     relaxed_caps = index.row_caps(params.row_day_cap_min, relaxed=True)
     relaxed = solve_phase_a(index, relaxed_caps, rest, stop, progress=progress, deadline=deadline)
-    return _PhaseA(relaxed.info.status, relaxed.plan, relaxed.info.best_bound, relaxed=True)
+    return _PhaseA(
+        relaxed.info.status,
+        relaxed.plan,
+        relaxed.info.best_bound,
+        relaxed=True,
+        caps=relaxed_caps,
+    )
 
 
 def _remaining(deadline: float) -> float:
@@ -215,7 +267,11 @@ def _remaining(deadline: float) -> float:
 
 
 def _better(
-    index: Index, probe: PhaseAOutcome, probe_plan: DayPlan, follow: PhaseAOutcome
+    index: Index,
+    caps: tuple[int, ...],
+    probe: PhaseAOutcome,
+    probe_plan: DayPlan,
+    follow: PhaseAOutcome,
 ) -> _PhaseA:
     bounds = [b for b in (probe.info.best_bound, follow.info.best_bound) if b is not None]
     bound = min(bounds) if bounds else None
@@ -223,12 +279,59 @@ def _better(
         follow.plan is not None
         and score(index, follow.plan).objective >= score(index, probe_plan).objective
     ):
-        return _PhaseA(follow.info.status, follow.plan, bound, relaxed=False)
+        return _PhaseA(follow.info.status, follow.plan, bound, relaxed=False, caps=caps)
     note = None
     if follow.info.status in {SolveStatus.MODEL_INVALID, SolveStatus.INFEASIBLE}:
         # The hinted follow-up of a feasible model cannot be either: keep the probe, but say so.
         note = f"{SolveStatus.FEASIBLE.value}; follow-up {follow.info.status.value}"
-    return _PhaseA(SolveStatus.FEASIBLE, probe_plan, bound, relaxed=False, note=note)
+    return _PhaseA(SolveStatus.FEASIBLE, probe_plan, bound, relaxed=False, caps=caps, note=note)
+
+
+def _cover(
+    index: Index, a: _PhaseA, params: Params, stop: StopHandle | None, budget: _Budget
+) -> _PhaseA:
+    """Coverage step (ADR 2026-11-14) on the ladder's plan; the plan it returns may replace it.
+
+    Runs only if some class has no in-person day, the job is not stopped and time is left. The
+    floor is the ladder plan's own objective: V* after OPTIMAL, the value found after FEASIBLE.
+    The new plan is taken only with strictly fewer classes without an in-person day and an
+    objective >= the floor; anything else (no plan, a stop) keeps the ladder's plan. Status,
+    bound and stop reason stay the ladder's; ``solve`` rescores the objective from the plan.
+    """
+    if a.plan is None or _is_stopped(stop):
+        return a
+    before = zero_day_classes(index, a.plan)
+    left = budget.deadline - time.monotonic()
+    if not before or left <= MIN_RUN_S:
+        return a
+    floor = score(index, a.plan).objective
+    config = _config(params, left, budget.det)
+    outcome = solve_coverage(
+        index, a.caps, a.plan, floor, config, stop=stop, deadline=budget.deadline
+    )
+    status = outcome.info.status
+    if outcome.plan is None or _is_stopped(stop):
+        _log_coverage("kept", status, len(before), None)
+        return a
+    after = zero_day_classes(index, outcome.plan)
+    if len(after) >= len(before) or score(index, outcome.plan).objective < floor:
+        _log_coverage("kept", status, len(before), len(after))
+        return a
+    _log_coverage("accepted", status, len(before), len(after))
+    return replace(a, plan=outcome.plan)
+
+
+def _log_coverage(verdict: str, status: SolveStatus, before: int, after: int | None) -> None:
+    """Counts and statuses only. A hinted feasible model cannot be INFEASIBLE / MODEL_INVALID."""
+    broken = status in {SolveStatus.INFEASIBLE, SolveStatus.MODEL_INVALID}
+    _log.log(
+        logging.WARNING if broken else logging.INFO,
+        "coverage step %s (%s): classes without an in-person day %d -> %s",
+        verdict,
+        status.value,
+        before,
+        "-" if after is None else after,
+    )
 
 
 def _no_plan(index: Index, params: Params, started: float, a: _PhaseA, *, stopped: bool) -> Result:

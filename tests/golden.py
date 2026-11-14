@@ -64,17 +64,27 @@ def violations(problem: Problem, result: Result) -> list[str]:
 
 def day_load(problem: Problem, result: Result, day: int) -> DayLoad:
     """The load of one school day as validator-lib reports it for ``/load``."""
-    outcome = _outcome(problem, result)
-    report = outcome.get("load")
-    if not isinstance(report, dict):
-        msg = f"validator-lib returned no load report ({outcome['status']})"
-        raise AssertionError(msg)  # noqa: TRY004 - a failed test check, not a type error
-    days = cast("list[Json]", cast("Json", report)["days"])
+    days = cast("list[Json]", _load(problem, result)["days"])
     (entry,) = (d for d in days if d["day"] == day)
     pupils = cast("int", entry["students_in_person"])
     teachers = cast("int", entry["teachers_on_site"])
     passport = cast("Json", cast("Json", entry["conditions"])["passport"])
     return DayLoad(pupils, teachers, cast("int", passport["load"]))
+
+
+def classes_without_in_person_days(problem: Problem, result: Result) -> list[str]:
+    """Classes with no in-person day all week, as validator-lib reports them for ``/load``."""
+    summary = cast("Json", _load(problem, result)["summary"])
+    return cast("list[str]", summary["classes_without_in_person_days"])
+
+
+def _load(problem: Problem, result: Result) -> Json:
+    outcome = _outcome(problem, result)
+    report = outcome.get("load")
+    if not isinstance(report, dict):
+        msg = f"validator-lib returned no load report ({outcome['status']})"
+        raise AssertionError(msg)  # noqa: TRY004 - a failed test check, not a type error
+    return cast("Json", report)
 
 
 def objective(problem: Problem, result: Result) -> Objective:
