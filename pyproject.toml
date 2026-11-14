@@ -92,6 +92,7 @@ filterwarnings = ["error"]
 markers = [
     "integration: needs Docker (Kafka/testcontainers); excluded from the default fast run",
     "slow: long-running test (seconds or more); deselect with -m 'not slow'",
+    "image: runs the built solver image (Docker); SOLVER_TEST_IMAGE or a local build",
 ]
 
 # ---------------------------------------------------------------- coverage
