@@ -42,9 +42,9 @@ from lad_solver.model.stop import StopHandle
 _log = logging.getLogger(__name__)
 
 PROBE_SHARE = 0.25  # no phase A solution within this share of its budget -> drop the row cap
-# Coverage step (ADR 2026-11-14). Only when some class can never earn an objective reward (static
-# orphans) does it get a reserve of min(10 s, 0.15 of the phase A budget) taken from the ladder,
-# or 0.15 of max_deterministic_time; otherwise it runs on what the ladder leaves.
+# Coverage step (ADR 2026-11-14) runs for at most min(10 s, 0.15 of the phase A budget), or 0.15 of
+# max_deterministic_time. Only when some class can never earn an objective reward (static orphans)
+# is that reserve taken from the ladder; otherwise it runs on what the ladder leaves.
 COVERAGE_MAX_S = 10.0
 COVERAGE_SHARE = 0.15
 PHASE_B_RESERVE_MAX_S = 15.0
@@ -79,6 +79,7 @@ class _PhaseA:
 class _Budget:
     deadline: float  # time.monotonic()
     det: float | None  # max_deterministic_time of the runs; None = wall clock only
+    max_s: float | None = None  # wall-clock cap of a run started later, from its own start
 
 
 def solve(
@@ -189,10 +190,10 @@ def _run_phase_a(
 def _coverage_budgets(index: Index, params: Params, deadline: float) -> tuple[_Budget, _Budget]:
     """(ladder, coverage step). The ladder gives up a reserve only for static orphans."""
     det = params.max_deterministic_time
-    coverage = _Budget(deadline, _share(det, COVERAGE_SHARE))
+    reserve = min(COVERAGE_MAX_S, COVERAGE_SHARE * max(deadline - time.monotonic(), 0.0))
+    coverage = _Budget(deadline, _share(det, COVERAGE_SHARE), max_s=reserve)
     if not static_orphans(index):
         return _Budget(deadline, det), coverage
-    reserve = min(COVERAGE_MAX_S, COVERAGE_SHARE * max(deadline - time.monotonic(), 0.0))
     return _Budget(deadline - reserve, _share(det, 1 - COVERAGE_SHARE)), coverage
 
 
@@ -301,14 +302,14 @@ def _cover(
     if a.plan is None or _is_stopped(stop):
         return a
     before = zero_day_classes(index, a.plan)
-    left = budget.deadline - time.monotonic()
+    now = time.monotonic()
+    end = budget.deadline if budget.max_s is None else min(budget.deadline, now + budget.max_s)
+    left = end - now
     if not before or left <= MIN_RUN_S:
         return a
     floor = score(index, a.plan).objective
     config = _config(params, left, budget.det)
-    outcome = solve_coverage(
-        index, a.caps, a.plan, floor, config, stop=stop, deadline=budget.deadline
-    )
+    outcome = solve_coverage(index, a.caps, a.plan, floor, config, stop=stop, deadline=end)
     status = outcome.info.status
     if outcome.plan is None or _is_stopped(stop):
         _log_coverage("kept", status, len(before), None)

@@ -7,6 +7,7 @@ value of the plan it starts from: a class the shelter cannot take without loweri
 stays remote (a tie-break, never a hard minimum). Every solved result passes the validator-lib CLI.
 """
 
+import time
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import replace
@@ -353,3 +354,22 @@ def test_coverage_is_reproducible_on_a_deterministic_budget(
     assert len(outcomes) == 2  # the coverage step ran in both solves
     assert _timeless(first) == _timeless(second)
     assert _zero_day(p, first) == []
+
+
+def test_coverage_step_is_capped_by_its_reserve(monkeypatch: pytest.MonkeyPatch) -> None:
+    # On a tight shelter A2 cannot prove its optimum; uncapped it ran to the phase A deadline.
+    real = phase_a.solve_coverage
+    spans: list[float] = []
+
+    def spy(*args: object, deadline: float, **kwargs: object) -> PhaseAOutcome:
+        spans.append(deadline - time.monotonic())
+        return real(*args, deadline=deadline, **kwargs)  # pyright: ignore[reportArgumentType]
+
+    monkeypatch.setattr(solve_module, "solve_coverage", spy)
+    p = _orphans()
+
+    result = solve(p, Params(time_limit_s=600, num_workers=1, random_seed=0))
+
+    assert len(spans) == 1
+    assert spans[0] <= solve_module.COVERAGE_MAX_S
+    assert _zero_day(p, result) == []
