@@ -52,6 +52,7 @@ _BAD = ConflictRule.INVALID_INPUT
 def _invalid_input(problem: Problem) -> Iterator[Conflict]:
     yield from _invalid_frame(problem)
     yield from _duplicate_ids(problem)
+    yield from _duplicate_rows(problem)
     yield from _invalid_entities(problem)
     yield from _invalid_rows(problem)
 
@@ -84,6 +85,18 @@ def _duplicate_ids(problem: Problem) -> Iterator[Conflict]:
     for teacher_id, n in Counter(t.id for t in problem.teachers).items():
         if n > 1:
             yield Conflict(_BAD, teacher_id=teacher_id)
+
+
+def _duplicate_rows(problem: Problem) -> Iterator[Conflict]:
+    """One teacher per class x subject (spec, section 04; split groups are after MVP).
+
+    A second row for the pair, any teacher, is a broken snapshot (validator-lib: duplicate_row).
+    """
+    for (class_id, subject_id), n in Counter(
+        (r.class_id, r.subject_id) for r in problem.rows
+    ).items():
+        if n > 1:
+            yield Conflict(_BAD, class_id=class_id, subject_id=subject_id)
 
 
 def _invalid_entities(problem: Problem) -> Iterator[Conflict]:

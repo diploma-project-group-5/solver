@@ -240,3 +240,15 @@ def test_stop_before_start_returns_unknown_without_timetable() -> None:
     result = solve(_one_class(Passport(100)), PARAMS, handle)
     assert result.status is SolveStatus.UNKNOWN
     assert result.stats.stop_reason is StopReason.STOPPED
+
+
+def test_duplicate_class_subject_row_is_model_invalid_without_solving() -> None:
+    p = problem(
+        classes=(klass("a", 10),),
+        teachers=(teacher("t1"), teacher("t2")),
+        rows=(row("a", PRIO, "t1", 2), row("a", PRIO, "t2", 1)),
+    )
+    result = solve(p, PARAMS)
+    assert result.status is SolveStatus.MODEL_INVALID
+    assert result.stats.stop_reason is StopReason.PRECHECK
+    assert result.lessons == ()
