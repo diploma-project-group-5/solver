@@ -32,18 +32,29 @@ jobs:
         run: uv sync --locked
 
       # Golden checks (tests/golden.py) send every result through the validator-lib CLI: the
-      # timetable rules live there only (Trello #73). Bump the tag with a release to agree with.
+      # timetable rules live there only (Trello #73). Pinned to the commit of a release tag (a tag can
+      # be moved) and built with npm ci, so transitive dependencies come from its lockfile.
+      # Bump the commit together with a validator-lib release the solver must agree with.
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38  # v6.5.0, resolved 2026-11-14
         with:
           node-version: "24"
 
-      - name: Install validator-lib CLI
+      - name: Check out validator-lib
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7, resolved 2026-11-08
+        with:
+          repository: diploma-project-group-5/validator-lib
+          ref: a73552d1d46a5f7b584278c9d61d96857d620722  # tag v0.2.0
+          path: _validator
+          persist-credentials: false
+
+      - name: Build validator-lib CLI (locked)
+        working-directory: _validator
         run: |
-          npm install --prefix "$RUNNER_TEMP/validator" --no-audit --no-fund \
-            "git+https://github.com/diploma-project-group-5/validator-lib.git#v0.2.0"
-          cli="$RUNNER_TEMP/validator/node_modules/@lad/validator-lib/dist/cli/main.js"
-          node "$cli" --version
-          echo "LAD_VALIDATE_CLI=$cli" >> "$GITHUB_ENV"
+          # The lockfile records the public @lad/contracts git dependency as ssh: fetch it over https.
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          npm ci --no-audit --no-fund  # prepare builds dist/
+          node dist/cli/main.js --version
+          echo "LAD_VALIDATE_CLI=$PWD/dist/cli/main.js" >> "$GITHUB_ENV"
 
       - name: Format
         run: uv run ruff format --check .
@@ -60,7 +71,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7, resolved 2026-11-08
         with:
           repository: diploma-project-group-5/contracts
-          ref: v0.2.0  # tag on the merge commit 4e4759a
+          ref: 6873552967f684b12955dc752435efc3ed180c52  # tag v0.3.0 (validator-lib uses the same)
           path: _contracts
           persist-credentials: false
 
@@ -121,18 +132,29 @@ jobs:
         run: uv sync --locked
 
       # Golden checks (tests/golden.py) send every result through the validator-lib CLI: the
-      # timetable rules live there only (Trello #73). Bump the tag with a release to agree with.
+      # timetable rules live there only (Trello #73). Pinned to the commit of a release tag (a tag can
+      # be moved) and built with npm ci, so transitive dependencies come from its lockfile.
+      # Bump the commit together with a validator-lib release the solver must agree with.
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38  # v6.5.0, resolved 2026-11-14
         with:
           node-version: "24"
 
-      - name: Install validator-lib CLI
+      - name: Check out validator-lib
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7, resolved 2026-11-08
+        with:
+          repository: diploma-project-group-5/validator-lib
+          ref: a73552d1d46a5f7b584278c9d61d96857d620722  # tag v0.2.0
+          path: _validator
+          persist-credentials: false
+
+      - name: Build validator-lib CLI (locked)
+        working-directory: _validator
         run: |
-          npm install --prefix "$RUNNER_TEMP/validator" --no-audit --no-fund \
-            "git+https://github.com/diploma-project-group-5/validator-lib.git#v0.2.0"
-          cli="$RUNNER_TEMP/validator/node_modules/@lad/validator-lib/dist/cli/main.js"
-          node "$cli" --version
-          echo "LAD_VALIDATE_CLI=$cli" >> "$GITHUB_ENV"
+          # The lockfile records the public @lad/contracts git dependency as ssh: fetch it over https.
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          npm ci --no-audit --no-fund  # prepare builds dist/
+          node dist/cli/main.js --version
+          echo "LAD_VALIDATE_CLI=$PWD/dist/cli/main.js" >> "$GITHUB_ENV"
 
       - name: Realistic school scenarios
         run: uv run pytest tests/realistic -m ""
@@ -147,6 +169,13 @@ jobs:
           persist-credentials: false
       - name: Build image
         run: docker build --tag lad-solver:${{ github.sha }} .
+
+      # Fixable HIGH/CRITICAL vulnerabilities in the image (OS packages and Python) fail the build.
+      - name: Scan image (trivy)
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy:0.76.1@sha256:790fd66d1697395d8693d1acaa1ea702406a20f109b6fc7bac8db623eca6c06c \
+            image --quiet --severity CRITICAL,HIGH --ignore-unfixed --exit-code 1 lad-solver:${{ github.sha }}
       # The default command is the Kafka worker, which needs a broker; smoke-test the CLI instead.
       - name: Smoke-run image
         run: |
