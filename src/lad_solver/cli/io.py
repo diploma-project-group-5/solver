@@ -5,6 +5,7 @@ mapped by the Kafka adapter). Parsing raises ``TypeError`` for a wrong JSON type
 ``ValueError`` for a bad enum value or a capacity shape that does not match the kind.
 """
 
+import hashlib
 import json
 from dataclasses import asdict
 from pathlib import Path
@@ -80,6 +81,12 @@ def result_to_json(result: Result) -> Json:
         ],
         "stats": asdict(result.stats),
     }
+
+
+def canonical_sha256(data: Json) -> str:
+    """Hash of a JSON document independent of key order and formatting (provenance of an input)."""
+    encoded = json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(encoded.encode()).hexdigest()
 
 
 def write_json(path: Path, data: Json) -> None:
