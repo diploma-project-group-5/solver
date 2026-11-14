@@ -31,6 +31,20 @@ jobs:
       - name: Install (locked)
         run: uv sync --locked
 
+      # Golden checks (tests/golden.py) send every result through the validator-lib CLI: the
+      # timetable rules live there only (Trello #73). Bump the tag with a release to agree with.
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38  # v6.5.0, resolved 2026-11-14
+        with:
+          node-version: "24"
+
+      - name: Install validator-lib CLI
+        run: |
+          npm install --prefix "$RUNNER_TEMP/validator" --no-audit --no-fund \
+            "git+https://github.com/diploma-project-group-5/validator-lib.git#v0.2.0"
+          cli="$RUNNER_TEMP/validator/node_modules/@lad/validator-lib/dist/cli/main.js"
+          node "$cli" --version
+          echo "LAD_VALIDATE_CLI=$cli" >> "$GITHUB_ENV"
+
       - name: Format
         run: uv run ruff format --check .
 
@@ -104,6 +118,20 @@ jobs:
 
       - name: Install (locked)
         run: uv sync --locked
+
+      # Golden checks (tests/golden.py) send every result through the validator-lib CLI: the
+      # timetable rules live there only (Trello #73). Bump the tag with a release to agree with.
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38  # v6.5.0, resolved 2026-11-14
+        with:
+          node-version: "24"
+
+      - name: Install validator-lib CLI
+        run: |
+          npm install --prefix "$RUNNER_TEMP/validator" --no-audit --no-fund \
+            "git+https://github.com/diploma-project-group-5/validator-lib.git#v0.2.0"
+          cli="$RUNNER_TEMP/validator/node_modules/@lad/validator-lib/dist/cli/main.js"
+          node "$cli" --version
+          echo "LAD_VALIDATE_CLI=$cli" >> "$GITHUB_ENV"
 
       - name: Realistic school scenarios
         run: uv run pytest tests/realistic -m ""

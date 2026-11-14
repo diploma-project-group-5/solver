@@ -10,7 +10,7 @@ from dataclasses import replace
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
-import oracle
+import golden
 from builders import OTHER, OUTSIDE, PRIO, klass, problem, row, teacher
 from lad_solver.app.solve import solve
 from lad_solver.domain.problem import (
@@ -39,6 +39,8 @@ def timetable_first(draw: st.DrawFn) -> Problem:
     days = tuple(range(1, n_days + 1))
     hours = Counter[tuple[str, str, str]]()
     busy_days: dict[str, set[int]] = {f"t{t}": set() for t in range(n_teachers)}
+    # One teacher per class x subject (spec 04, no split groups): a second one is a broken snapshot.
+    owner: dict[tuple[str, str], str] = {}
     for d in days:
         for _ in range(lessons_per_day):
             free = [f"t{t}" for t in range(n_teachers)]
@@ -46,9 +48,14 @@ def timetable_first(draw: st.DrawFn) -> Problem:
                 pick = draw(st.none() | st.sampled_from(free)) if free else None
                 if pick is None:
                     continue
+                subjects = [s for s in SUBJECT_IDS if owner.get((f"c{c}", s), pick) == pick]
+                if not subjects:
+                    continue
+                subject = draw(st.sampled_from(subjects))
+                owner[f"c{c}", subject] = pick
                 free.remove(pick)
                 busy_days[pick].add(d)
-                hours[f"c{c}", draw(st.sampled_from(SUBJECT_IDS)), pick] += 1
+                hours[f"c{c}", subject, pick] += 1
     load = Counter[str]()
     for (_, _, t), h in hours.items():
         load[t] += h
@@ -78,8 +85,8 @@ def timetable_first(draw: st.DrawFn) -> Problem:
 def _optimal(p: Problem) -> Result:
     result = solve(p, PARAMS)
     assert result.status is SolveStatus.OPTIMAL, result.status
-    assert oracle.violations(p, result) == []
-    assert result.stats.objective == oracle.objective(p, result).value
+    assert golden.violations(p, result) == []
+    assert result.stats.objective == golden.objective(p, result).value
     return result
 
 
@@ -139,7 +146,7 @@ def alert_first(draw: st.DrawFn) -> Problem:
 @SETTINGS
 @given(alert_first())
 def test_alert_problem_is_never_infeasible_and_respects_seats(p: Problem) -> None:
-    _optimal(p)  # the oracle checks seats, passport and no-shelter lessons on remote days
+    _optimal(p)  # validator-lib checks seats, passport and no-shelter lessons on remote days
 
 
 @SETTINGS

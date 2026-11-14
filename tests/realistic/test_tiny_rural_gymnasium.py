@@ -14,7 +14,7 @@ from functools import cache
 
 import pytest
 
-import oracle
+import golden
 from lad_solver.app.solve import solve
 from lad_solver.domain.problem import (
     CurriculumRow,
@@ -190,8 +190,8 @@ def test_builds_optimal_admissible_timetable_within_limit() -> None:
     assert result.status is SolveStatus.OPTIMAL
     assert result.stats.stop_reason is StopReason.COMPLETED
     assert not result.stats.quality_relaxed
-    assert oracle.violations(p, result) == []
-    recomputed = oracle.objective(p, result)
+    assert golden.violations(p, result) == []
+    recomputed = golden.objective(p, result)
     assert (result.stats.objective, result.stats.primary, result.stats.secondary) == (
         recomputed.value,
         recomputed.primary,
@@ -204,7 +204,7 @@ def test_passport_holds_every_day() -> None:
     p, result = _school(), _solved()
     assert result.status is SolveStatus.OPTIMAL
     for day in p.school_days:
-        load = oracle.day_load(p, result, day)
+        load = golden.day_load(p, result, day)
         assert load.people <= FULL_PASSPORT, f"day {day}: {load}"
 
 
@@ -216,7 +216,7 @@ def test_every_priority_lesson_is_in_person() -> None:
     priority = {s.id for s in p.subjects if s.priority_area}
     bound = sum(students[r.class_id] * r.hours for r in p.rows if r.subject_id in priority)
     assert result.stats.primary == bound
-    in_person = oracle.in_person_days(result)
+    in_person = golden.in_person_days(result)
     carrying = {(x.class_id, x.day) for x in result.lessons if x.subject_id in priority}
     assert carrying <= in_person
 
@@ -241,7 +241,7 @@ def test_passport_one_short_still_admissible() -> None:
     p = build_school(FULL_PASSPORT - 1)
     result = solve(p, PARAMS)
     assert result.status in {SolveStatus.OPTIMAL, SolveStatus.FEASIBLE}
-    assert oracle.violations(p, result) == []
+    assert golden.violations(p, result) == []
     for day in p.school_days:
-        assert oracle.day_load(p, result, day).people <= FULL_PASSPORT - 1
+        assert golden.day_load(p, result, day).people <= FULL_PASSPORT - 1
     assert result.stats.wall_time_s < TIME_LIMIT_S

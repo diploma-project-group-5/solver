@@ -6,7 +6,7 @@ of what the demo must handle: grades 1-6 x 5 parallels + grades 7-11 x 4 = 50 cl
 passport (700) holds about half of the ~1400 people, so capacity is the binding constraint.
 
 The problem is built deterministically (fixed seed); one 90 s solve on 2 workers is shared by
-all checks, and every result is verified by the independent oracle.
+all checks, and every result is verified by the validator-lib CLI.
 """
 
 import random
@@ -14,7 +14,7 @@ from collections import Counter, defaultdict
 
 import pytest
 
-import oracle
+import golden
 from lad_solver.app.solve import solve
 from lad_solver.domain.prechecks import precheck
 from lad_solver.domain.problem import (
@@ -285,13 +285,13 @@ def test_scenario_matches_archetype_and_passes_prechecks(lyceum: Problem) -> Non
 @pytest.mark.slow
 def test_large_build_is_feasible_valid_and_not_relaxed(lyceum: Problem, solved: Result) -> None:
     assert solved.status in {SolveStatus.OPTIMAL, SolveStatus.FEASIBLE}
-    assert oracle.violations(lyceum, solved) == []
+    assert golden.violations(lyceum, solved) == []
     assert not solved.stats.quality_relaxed
     expected_stop = (
         StopReason.COMPLETED if solved.status is SolveStatus.OPTIMAL else StopReason.TIME_LIMIT
     )
     assert solved.stats.stop_reason is expected_stop
-    recomputed = oracle.objective(lyceum, solved)
+    recomputed = golden.objective(lyceum, solved)
     assert (solved.stats.primary, solved.stats.secondary, solved.stats.objective) == (
         recomputed.primary,
         recomputed.secondary,
@@ -304,7 +304,7 @@ def test_passport_holds_every_day_and_is_actually_used(lyceum: Problem, solved: 
     pupils = sum(c.students for c in lyceum.classes)
     in_person_pupils = 0
     for day in DAYS:
-        load = oracle.day_load(lyceum, solved, day)
+        load = golden.day_load(lyceum, solved, day)
         assert load.people <= PASSPORT, f"day {day}: {load}"
         in_person_pupils += load.pupils
     share = in_person_pupils / (pupils * len(DAYS))

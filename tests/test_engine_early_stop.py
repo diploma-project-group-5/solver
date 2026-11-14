@@ -9,7 +9,7 @@ from dataclasses import replace
 import pytest
 from ortools.sat.python import cp_model
 
-import oracle
+import golden
 from lad_solver.app import solve as solve_module
 from lad_solver.app.solve import solve, stop_reason
 from lad_solver.cli.generate import generate_problem
@@ -97,7 +97,7 @@ def test_stall_stops_a_plateaued_school_long_before_the_limit() -> None:
     elapsed = time.monotonic() - started
 
     assert result.status in {SolveStatus.OPTIMAL, SolveStatus.FEASIBLE}
-    assert oracle.violations(problem, result) == []
+    assert golden.violations(problem, result) == []
     assert not handle.stopped  # the stall never goes through the SIGTERM handle
     if result.status is SolveStatus.FEASIBLE:
         assert result.stats.stop_reason is StopReason.NO_IMPROVEMENT
@@ -265,7 +265,7 @@ def test_probe_stopped_by_the_stall_rule_skips_the_follow_up(
 
     assert calls == [False]  # the probe only, no hinted follow-up
     assert result.stats.stop_reason is StopReason.NO_IMPROVEMENT
-    assert oracle.violations(problem, result) == []
+    assert golden.violations(problem, result) == []
 
 
 def test_default_params_stay_reproducible_on_a_deterministic_budget() -> None:

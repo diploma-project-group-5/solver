@@ -28,7 +28,7 @@ from kafka_support import (
 )
 from referencing import Registry, Resource
 
-import oracle
+import golden
 from builders import OTHER, subjects
 from lad_solver.adapters.kafka.mapping import (
     Address,
@@ -280,7 +280,7 @@ def test_capacity_vector_loads_match_the_oracle(vector: Path) -> None:
     case = _load(vector)
     problem, result = _vector_day(case)
 
-    load = oracle.day_load(problem, result, 1)
+    load = golden.day_load(problem, result, 1)
 
     expected = case["expected"]
     assert (load.pupils, load.teachers) == (
@@ -290,7 +290,7 @@ def test_capacity_vector_loads_match_the_oracle(vector: Path) -> None:
     assert expected["conditions"]["passport"]["load"] == load.people
     if "seats" in expected["conditions"]:
         assert expected["conditions"]["seats"]["load"] == load.pupils
-    assert (oracle.violations(problem, result) == []) == expected["ok"]
+    assert (golden.violations(problem, result) == []) == expected["ok"]
 
 
 @pytest.mark.parametrize("vector", _vectors(), ids=lambda p: p.stem)
