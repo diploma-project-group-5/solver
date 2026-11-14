@@ -43,8 +43,9 @@ _log = logging.getLogger(__name__)
 
 PROBE_SHARE = 0.25  # no phase A solution within this share of its budget -> drop the row cap
 # Coverage step (ADR 2026-11-14) runs for at most min(10 s, 0.15 of the phase A budget), or 0.15 of
-# max_deterministic_time. Only when some class can never earn an objective reward (static orphans)
-# is that reserve taken from the ladder; otherwise it runs on what the ladder leaves.
+# max_deterministic_time (the wall clock is then only the safety net, shared with the ladder). Only
+# when some class can never earn an objective reward (static orphans) is that reserve taken from
+# the ladder; otherwise it runs on what the ladder leaves.
 COVERAGE_MAX_S = 10.0
 COVERAGE_SHARE = 0.15
 PHASE_B_RESERVE_MAX_S = 15.0
@@ -80,6 +81,12 @@ class _Budget:
     deadline: float  # time.monotonic()
     det: float | None  # max_deterministic_time of the runs; None = wall clock only
     max_s: float | None = None  # wall-clock cap of a run started later, from its own start
+
+    def end(self, now: float) -> float:
+        """Wall-clock end of a run started at ``now``; with ``det``, ``deadline`` (safety net)."""
+        if self.det is not None or self.max_s is None:
+            return self.deadline
+        return min(self.deadline, now + self.max_s)
 
 
 def solve(
@@ -188,13 +195,22 @@ def _run_phase_a(
 
 
 def _coverage_budgets(index: Index, params: Params, deadline: float) -> tuple[_Budget, _Budget]:
-    """(ladder, coverage step). The ladder gives up a reserve only for static orphans."""
+    """(ladder, coverage step). The ladder gives up a reserve only for static orphans.
+
+    A deterministic budget splits the work (0.15 of it for the step), as in the ladder itself: the
+    wall clock is then just the safety net, the same ``deadline`` for both, and the wall-clock
+    reserve and cap do not apply (they would make a seeded result depend on the machine).
+    """
+    orphans = bool(static_orphans(index))
     det = params.max_deterministic_time
+    if det is not None:
+        ladder_det = det * (1 - COVERAGE_SHARE) if orphans else det
+        return _Budget(deadline, ladder_det), _Budget(deadline, det * COVERAGE_SHARE)
     reserve = min(COVERAGE_MAX_S, COVERAGE_SHARE * max(deadline - time.monotonic(), 0.0))
-    coverage = _Budget(deadline, _share(det, COVERAGE_SHARE), max_s=reserve)
-    if not static_orphans(index):
-        return _Budget(deadline, det), coverage
-    return _Budget(deadline - reserve, _share(det, 1 - COVERAGE_SHARE)), coverage
+    coverage = _Budget(deadline, None, max_s=reserve)
+    if not orphans:
+        return _Budget(deadline, None), coverage
+    return _Budget(deadline - reserve, None), coverage
 
 
 def _config(params: Params, time_limit_s: float, det: float | None = None) -> SolverConfig:
@@ -303,7 +319,7 @@ def _cover(
         return a
     before = zero_day_classes(index, a.plan)
     now = time.monotonic()
-    end = budget.deadline if budget.max_s is None else min(budget.deadline, now + budget.max_s)
+    end = budget.end(now)
     left = end - now
     if not before or left <= MIN_RUN_S:
         return a
