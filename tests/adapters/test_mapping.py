@@ -10,6 +10,7 @@ from kafka_support import (
     JOB_ID,
     NOW,
     SCHOOL_ID,
+    Json,
     build_request,
     encode,
     feasible_result,
@@ -102,6 +103,17 @@ def test_duplicate_curriculum_row_is_rejected() -> None:
     document = with_data(build_request(), lambda d: d["rows"].append(dict(d["rows"][0])))
 
     assert isinstance(parse_build_request(encode(document)), Rejected)
+
+
+def test_second_teacher_for_same_class_and_subject_is_rejected() -> None:
+    # One teacher per class x subject (spec); a second row for the pair is a broken snapshot.
+    def add_second_teacher(d: Json) -> None:
+        d["rows"].append(dict(d["rows"][0], teacher_id=d["teachers"][1]["id"], hours=1))
+
+    outcome = parse_build_request(encode(with_data(build_request(), add_second_teacher)))
+
+    assert isinstance(outcome, Rejected)
+    assert outcome.code is ErrorCode.INVALID_PAYLOAD
 
 
 def test_wrong_event_type_with_job_id_is_rejected() -> None:
