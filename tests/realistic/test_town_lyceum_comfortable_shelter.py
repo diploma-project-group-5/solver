@@ -3,7 +3,7 @@
 Archetype ``town_lyceum_comfortable_shelter``: 22 classes, 546 pupils, 35 teachers, 14 staff,
 main timetable (model 1.1) with ``Passport(386)`` ~ 65% of 595 people, Mon-Fri, 7 lessons.
 Capacity is comfortable, so the build is feasible; what matters is the quality of the split
-between in-person and remote days. Every result is checked by the independent oracle.
+between in-person and remote days. Every result is checked by the validator-lib CLI.
 
 The problem is built deterministically (no randomness); ids are opaque and PD-free.
 """
@@ -13,7 +13,7 @@ from dataclasses import dataclass
 
 import pytest
 
-import oracle
+import golden
 from lad_solver.app.solve import solve
 from lad_solver.domain.prechecks import precheck
 from lad_solver.domain.problem import (
@@ -201,8 +201,8 @@ def test_scenario_matches_archetype_and_passes_prechecks() -> None:
 def test_builds_admissible_timetable_within_time_limit(solved: Solved) -> None:
     p, result = solved.problem, solved.result
     assert result.status in {SolveStatus.OPTIMAL, SolveStatus.FEASIBLE}
-    assert oracle.violations(p, result) == []
-    recomputed = oracle.objective(p, result)
+    assert golden.violations(p, result) == []
+    recomputed = golden.objective(p, result)
     assert result.stats.objective == recomputed.value
     assert result.stats.primary == recomputed.primary
     assert result.stats.secondary == 0  # no priority classes
@@ -215,7 +215,7 @@ def test_builds_admissible_timetable_within_time_limit(solved: Solved) -> None:
 @pytest.mark.slow
 def test_passport_holds_every_day_and_shelter_is_used(solved: Solved) -> None:
     p, result = solved.problem, solved.result
-    loads = [oracle.day_load(p, result, d) for d in DAYS]
+    loads = [golden.day_load(p, result, d) for d in DAYS]
     assert all(x.people <= PASSPORT for x in loads), loads
     # Comfortable shelter: an optimiser fills it; leaving most of it empty is a quality bug.
     assert all(x.people >= 0.9 * PASSPORT for x in loads), loads
@@ -225,7 +225,7 @@ def test_passport_holds_every_day_and_shelter_is_used(solved: Solved) -> None:
 def test_in_person_share_close_to_shelter_share(solved: Solved) -> None:
     p, result = solved.problem, solved.result
     students = {c.id: c.students for c in p.classes}
-    in_person = oracle.in_person_days(result)
+    in_person = golden.in_person_days(result)
     pupil_days = sum(students[c] for c, _ in in_person)
     share = pupil_days / (sum(students.values()) * len(DAYS))
     # Upper bound: per day pupils <= 386 - 14 staff - in-person teachers, i.e. < 372 / 546.

@@ -29,3 +29,12 @@ uv run pyright               # strict type checking
 ```
 
 Integration tests (Kafka via testcontainers) are marked `integration` and need Docker.
+
+Results in tests are checked by the validator-lib CLI, not by Python rules (`tests/golden.py`): the timetable
+rules live in validator-lib only. The tests need Node 24 and `LAD_VALIDATE_CLI` pointing at the CLI; without it
+they fail instead of passing silently. CI installs the tag pinned in `.github/workflows/ci.yml`:
+
+```bash
+npm install --prefix /tmp/validator "git+https://github.com/diploma-project-group-5/validator-lib.git#v0.2.0"
+export LAD_VALIDATE_CLI=/tmp/validator/node_modules/@lad/validator-lib/dist/cli/main.js
+```

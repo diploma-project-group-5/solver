@@ -14,7 +14,7 @@ from dataclasses import replace
 
 import pytest
 
-import oracle
+import golden
 from lad_solver.app.solve import solve
 from lad_solver.domain.problem import (
     CurriculumRow,
@@ -145,27 +145,27 @@ def solved(school: Problem) -> Result:
 @pytest.mark.slow
 def test_main_timetable_is_feasible_and_admissible(school: Problem, solved: Result) -> None:
     assert solved.status in {SolveStatus.OPTIMAL, SolveStatus.FEASIBLE}
-    assert oracle.violations(school, solved) == []
-    recomputed = oracle.objective(school, solved)
+    assert golden.violations(school, solved) == []
+    recomputed = golden.objective(school, solved)
     assert solved.stats.objective == recomputed.value
     assert not solved.stats.quality_relaxed
     assert solved.stats.first_solution_s is not None
     assert solved.stats.first_solution_s < 5.0  # prototype: 0.06 s
     assert solved.stats.wall_time_s <= TIME_LIMIT_S + 2.0
-    share = len(oracle.in_person_days(solved)) / (len(school.classes) * len(DAYS))
+    share = len(golden.in_person_days(solved)) / (len(school.classes) * len(DAYS))
     assert share >= 0.4  # ~0.5 expected under a 60% shelter
 
 
 @pytest.mark.slow
 def test_passport_holds_every_day(school: Problem, solved: Result) -> None:
     for d in DAYS:
-        load = oracle.day_load(school, solved, d)
+        load = golden.day_load(school, solved, d)
         assert load.people <= PASSPORT, f"day {d}: {load}"
 
 
 @pytest.mark.slow
 def test_specialists_teach_in_one_format_per_day(solved: Result) -> None:
-    in_person = oracle.in_person_days(solved)
+    in_person = golden.in_person_days(solved)
     formats: defaultdict[tuple[str, int], set[bool]] = defaultdict(set)
     for x in solved.lessons:
         if x.teacher_id in {T_FLANG, T_PE}:
@@ -187,7 +187,7 @@ def test_no_remote_grade_one_day_could_be_made_in_person_alone(
 ) -> None:
     # Flipping a remote grade-1 day with lessons raises at least the secondary objective, so
     # a single admissible flip means the engine left an obvious gain on the table.
-    in_person = oracle.in_person_days(solved)
+    in_person = golden.in_person_days(solved)
     students = {c.id: c.students for c in school.classes}
     for cid in sorted(GRADE_ONE):
         for d in DAYS:
@@ -202,7 +202,7 @@ def test_no_remote_grade_one_day_could_be_made_in_person_alone(
             on_site = {
                 x.teacher_id for x in solved.lessons if x.day == d and (x.class_id, d) in in_person
             }
-            people = oracle.day_load(school, solved, d).people + students[cid]
+            people = golden.day_load(school, solved, d).people + students[cid]
             people += len(mine - on_site)
             assert not (consistent and people <= PASSPORT), f"{cid} day {d}: {people} people"
 

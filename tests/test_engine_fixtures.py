@@ -1,12 +1,12 @@
 """Hand fixtures with OPTIMAL objective values (ADR 2026-11-04 §5, testing.md capacity cases).
 
 Assertions are on objective values and formats, not on exact grids; every solved result also
-passes the independent oracle.
+passes the validator-lib CLI.
 """
 
 import pytest
 
-import oracle
+import golden
 from builders import OTHER, OUTSIDE, PRIO, klass, problem, row, teacher
 from lad_solver.app.solve import solve
 from lad_solver.domain.problem import AlertLimits, Params, Passport, Problem, TimetableKind
@@ -19,8 +19,8 @@ ALERT = TimetableKind.ALERT
 def _solve(p: Problem) -> Result:
     result = solve(p, PARAMS)
     assert result.status is SolveStatus.OPTIMAL
-    assert oracle.violations(p, result) == []
-    recomputed = oracle.objective(p, result)
+    assert golden.violations(p, result) == []
+    recomputed = golden.objective(p, result)
     assert result.stats.objective == recomputed.value
     assert (result.stats.primary, result.stats.secondary) == (
         recomputed.primary,
@@ -89,7 +89,11 @@ def test_capacity_beyond_int64_is_an_unlimited_shelter(
         days=(1,),
         staff=2**63,
     )
-    assert _solve(p).stats.objective == 40
+    # Outside the contract (staff <= 100000): validator-lib rejects such a snapshot, so only the
+    # engine's robustness and objective are checked here, not the timetable rules.
+    result = solve(p, PARAMS)
+    assert result.status is SolveStatus.OPTIMAL
+    assert result.stats.objective == golden.objective(p, result).value == 40
 
 
 def test_teacher_with_several_in_person_lessons_is_counted_once() -> None:
@@ -113,7 +117,7 @@ def test_teacher_with_only_remote_lessons_is_not_counted() -> None:
     )
     result = _solve(p)
     assert result.stats.objective == 40
-    assert oracle.in_person_days(result) == {("a", 1)}
+    assert golden.in_person_days(result) == {("a", 1)}
 
 
 @pytest.mark.parametrize(("second", "objective"), [("t1", 0), ("t2", 20)], ids=["shared", "own"])
@@ -145,7 +149,7 @@ def test_no_shelter_only_on_remote_days_and_only_for_alert(
     result = _solve(p)
     assert result.stats.objective == objective
     if kind is ALERT:
-        in_person = oracle.in_person_days(result)
+        in_person = golden.in_person_days(result)
         assert all(
             (x.class_id, x.day) not in in_person for x in result.lessons if x.subject_id == OUTSIDE
         )
@@ -160,7 +164,7 @@ def test_empty_day_is_never_in_person() -> None:
     )
     result = _solve(p)
     assert result.stats.objective == 3 * 20 + 1  # one in-person day, not two
-    assert len(oracle.in_person_days(result)) == 1
+    assert len(golden.in_person_days(result)) == 1
 
 
 def test_class_priority_flag_only_breaks_ties() -> None:
@@ -172,7 +176,7 @@ def test_class_priority_flag_only_breaks_ties() -> None:
         days=(1,),
     )
     result = _solve(p)
-    assert oracle.in_person_days(result) == {("b", 1)}  # 21 pupils beat the flag
+    assert golden.in_person_days(result) == {("b", 1)}  # 21 pupils beat the flag
     assert result.stats.objective == 2 * 21
 
 

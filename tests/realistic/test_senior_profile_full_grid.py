@@ -11,7 +11,7 @@ from collections import Counter
 
 import pytest
 
-import oracle
+import golden
 from lad_solver.app.solve import solve
 from lad_solver.domain.prechecks import precheck
 from lad_solver.domain.problem import (
@@ -151,11 +151,11 @@ def test_full_grid_is_solved_within_the_limit_and_passes_the_oracle(
 ) -> None:
     p, result = full_grid
     assert result.status in {SolveStatus.OPTIMAL, SolveStatus.FEASIBLE}
-    assert oracle.violations(p, result) == []
+    assert golden.violations(p, result) == []
     assert not result.stats.quality_relaxed
     assert result.stats.wall_time_s < TIME_LIMIT_S + 2.0
     assert result.stats.first_solution_s is not None
-    assert result.stats.objective == oracle.objective(p, result).value
+    assert result.stats.objective == golden.objective(p, result).value
 
 
 @pytest.mark.slow
@@ -178,10 +178,10 @@ def test_passport_holds_every_day_and_some_classes_attend(
 ) -> None:
     p, result = full_grid
     for d in DAYS:
-        load = oracle.day_load(p, result, d)
+        load = golden.day_load(p, result, d)
         assert load.people <= PASSPORT, (d, load)
     # Everything remote is admissible but useless; the half-size passport leaves room for some.
-    share = len(oracle.in_person_days(result)) / (len(CLASS_IDS) * len(DAYS))
+    share = len(golden.in_person_days(result)) / (len(CLASS_IDS) * len(DAYS))
     assert share > 0
     assert result.stats.primary is not None
     assert result.stats.primary > 0
@@ -192,7 +192,7 @@ def test_heavy_teachers_work_in_one_format_per_day_within_their_limit(
     full_grid: tuple[Problem, Result],
 ) -> None:
     _, result = full_grid
-    in_person = oracle.in_person_days(result)
+    in_person = golden.in_person_days(result)
     weekly = Counter(x.teacher_id for x in result.lessons)
     heavy = {t for t, n in weekly.items() if n >= 24}
     assert heavy == {"t-01", "t-02", "t-03", "t-04", "t-06", "t-07", "t-10", "t-12"}

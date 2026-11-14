@@ -6,7 +6,7 @@ Based on Kharkiv (a shelter for 83 people holds three classes, two shifts) and Z
 Passport(171) leaves room for five or six classes plus their teachers per day, so the day
 assignment is a knapsack over classes with every in-person teacher counted once.
 
-Assertions are on behaviour (status, oracle, capacity, objective properties), never on grids.
+Assertions are on behaviour (status, validator-lib, capacity, objective properties), never on grids.
 """
 
 from collections import Counter
@@ -15,7 +15,7 @@ from functools import cache
 
 import pytest
 
-import oracle
+import golden
 from lad_solver.app.solve import solve
 from lad_solver.domain.problem import (
     CurriculumRow,
@@ -194,8 +194,8 @@ def solved(passport: int = PASSPORT) -> Result:
 
 def _assert_admissible(problem: Problem, result: Result) -> None:
     assert result.status in FOUND, result.status
-    assert oracle.violations(problem, result) == []
-    recomputed = oracle.objective(problem, result)
+    assert golden.violations(problem, result) == []
+    recomputed = golden.objective(problem, result)
     assert result.stats.objective == recomputed.value
 
 
@@ -230,11 +230,11 @@ def test_passport_is_binding_on_every_day() -> None:
     _assert_admissible(p, result)
     biggest = max(c.students for c in p.classes)
     for d in DAYS:
-        load = oracle.day_load(p, result, d)
+        load = golden.day_load(p, result, d)
         assert load.people <= PASSPORT, (d, load)
         # Within about one class of the limit: the day is filled, not left half empty.
         assert load.people >= PASSPORT - biggest - 5, (d, load)
-    share = len(oracle.in_person_days(result)) / (len(p.classes) * len(DAYS))
+    share = len(golden.in_person_days(result)) / (len(p.classes) * len(DAYS))
     assert 0.25 <= share <= 0.45, share
 
 
@@ -244,7 +244,7 @@ def test_priority_classes_in_person_days_are_counted_in_the_objective() -> None:
     # in-person days on average" is not a guaranteed property; check that it is counted instead.
     p, result = gymnasium(), solved()
     _assert_admissible(p, result)
-    days_of = Counter(c for c, _ in oracle.in_person_days(result))
+    days_of = Counter(c for c, _ in golden.in_person_days(result))
     flagged_days = sum(days_of[c.id] for c in p.classes if c.priority)
     assert result.stats.secondary == flagged_days
     assert flagged_days > 0
@@ -257,12 +257,12 @@ def test_kharkiv_shelter_for_83_still_feasible_with_two_or_three_classes() -> No
     _assert_admissible(p, result)
     # Hard rules only: the run stops at the time limit (FEASIBLE), so "no room for one more
     # class" or "strictly worse than the wider shelter" are optimality claims, not guarantees.
-    per_day = Counter(d for _, d in oracle.in_person_days(result))
+    per_day = Counter(d for _, d in golden.in_person_days(result))
     for d in DAYS:
-        load = oracle.day_load(p, result, d)
+        load = golden.day_load(p, result, d)
         assert load.people <= KHARKIV_PASSPORT, (d, load)
         assert per_day[d] <= MAX_KHARKIV_CLASSES, (d, per_day[d])
     assert sum(per_day.values()) >= len(DAYS), per_day  # the shelter is used, not "all remote"
     if solved().status is SolveStatus.OPTIMAL:  # only then is the wider shelter's run a bound
         wider = replace(p, capacity=Passport(PASSPORT))
-        assert oracle.objective(wider, result).primary <= oracle.objective(wider, solved()).primary
+        assert golden.objective(wider, result).primary <= golden.objective(wider, solved()).primary

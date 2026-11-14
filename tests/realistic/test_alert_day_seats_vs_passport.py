@@ -5,8 +5,8 @@ technologies cannot be held in the shelter, so they force remote days. Variant `
 seats condition binding, variant ``b`` the passport condition; variant ``c`` uses short alert
 bells (6 lessons) that cannot hold the 31-33 weekly hours of grades 6-11.
 
-Every solved result is checked by the independent ``oracle``; the per-day checks below restate
-the binding condition explicitly.
+Every solved result is checked by the validator-lib CLI (``golden``); the per-day checks
+below restate the binding condition explicitly.
 """
 
 from collections import Counter
@@ -14,7 +14,7 @@ from functools import cache
 
 import pytest
 
-import oracle
+import golden
 from lad_solver.app.solve import solve
 from lad_solver.domain.problem import (
     AlertLimits,
@@ -273,13 +273,13 @@ def test_scenario_is_realistic() -> None:
 def test_alert_build_is_feasible_admissible_and_in_time(variant: str) -> None:
     p, result = _solved(variant)
     assert result.status in {SolveStatus.OPTIMAL, SolveStatus.FEASIBLE}
-    assert oracle.violations(p, result) == []
+    assert golden.violations(p, result) == []
     assert result.stats.wall_time_s <= TIME_LIMIT_S + WALL_SLACK_S
     assert result.stats.first_solution_s is not None
     assert result.stats.first_solution_s < TIME_LIMIT_S
     assert result.stats.primary is not None
     assert result.stats.primary > 0  # some priority lessons are in person, not "all remote"
-    assert oracle.in_person_days(result)
+    assert golden.in_person_days(result)
 
 
 @pytest.mark.slow
@@ -289,7 +289,7 @@ def test_both_capacity_conditions_hold_every_day(variant: str) -> None:
     cap = p.capacity
     assert isinstance(cap, AlertLimits)
     for d in p.school_days:
-        load = oracle.day_load(p, result, d)
+        load = golden.day_load(p, result, d)
         assert load.pupils <= cap.seats, (d, load)
         assert load.people <= cap.passport, (d, load)
 
@@ -306,7 +306,7 @@ def test_binding_condition_is_tight(variant: str, binding: str) -> None:
     cap = p.capacity
     assert isinstance(cap, AlertLimits)
     smallest = min(c.students for c in p.classes)
-    loads = [oracle.day_load(p, result, d) for d in p.school_days]
+    loads = [golden.day_load(p, result, d) for d in p.school_days]
     if binding == "seats":
         assert max(x.pupils for x in loads) > cap.seats - smallest
         # The passport has slack every day: it is not what limits variant a.
@@ -321,7 +321,7 @@ def test_binding_condition_is_tight(variant: str, binding: str) -> None:
 @pytest.mark.parametrize("variant", ["a", "b"])
 def test_pe_and_tech_only_on_remote_days(variant: str) -> None:
     p, result = _solved(variant)
-    in_person = oracle.in_person_days(result)
+    in_person = golden.in_person_days(result)
     outside = {s.id for s in p.subjects if s.no_shelter}
     assert all(
         (x.class_id, x.day) not in in_person for x in result.lessons if x.subject_id in outside

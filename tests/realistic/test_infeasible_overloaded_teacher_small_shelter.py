@@ -14,7 +14,7 @@ from collections import Counter
 
 import pytest
 
-import oracle
+import golden
 from lad_solver.app.solve import solve
 from lad_solver.domain.problem import (
     CurriculumRow,
@@ -263,8 +263,8 @@ def test_shelter_too_small_for_one_class_is_optimal_all_remote(
     p, result = control
     assert result.status is SolveStatus.OPTIMAL
     assert result.conflicts == ()
-    assert oracle.violations(p, result) == []
-    recomputed = oracle.objective(p, result)
+    assert golden.violations(p, result) == []
+    recomputed = golden.objective(p, result)
     assert result.stats.objective == recomputed.value == 0
     assert len(result.day_formats) == len(p.classes) * len(p.school_days)
     assert not any(f.in_person for f in result.day_formats)  # in-person share 0
@@ -276,7 +276,7 @@ def test_control_passport_holds_every_day_with_nobody_but_staff(
 ) -> None:
     p, result = control
     for day in p.school_days:
-        load = oracle.day_load(p, result, day)
+        load = golden.day_load(p, result, day)
         assert load.people <= CONTROL_SHELTER.passport
         assert (load.pupils, load.teachers, load.people) == (0, 0, STAFF)
     # With the part-time restriction lifted, t-03 must use at least four days: 22 > 7 x 3.

@@ -1,4 +1,4 @@
-"""Make test-only helpers (``builders``, ``oracle``) importable with ``--import-mode=importlib``."""
+"""Make test-only helpers (``builders``, ``golden``) importable with ``--import-mode=importlib``."""
 
 import sys
 from pathlib import Path

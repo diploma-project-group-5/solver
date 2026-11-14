@@ -7,7 +7,7 @@ from typing import Any
 import pytest
 from ortools.sat.python import cp_model
 
-import oracle
+import golden
 from builders import OTHER, PRIO, klass, problem, row, teacher
 from lad_solver.app import solve as solve_module
 from lad_solver.domain.problem import Params, Problem
@@ -72,8 +72,8 @@ def test_phase_b_timeout_retries_each_day_and_keeps_the_phase_a_plan(
     result = solve_module.solve(p, PARAMS, StopHandle())
 
     assert result.status in {SolveStatus.OPTIMAL, SolveStatus.FEASIBLE}
-    assert oracle.violations(p, result) == []
-    assert result.stats.objective == oracle.objective(p, result).value
+    assert golden.violations(p, result) == []
+    assert result.stats.objective == golden.objective(p, result).value
     retries = [c for c in calls if not c[2]]
     assert retries == [(solve_module.PHASE_B_RETRY_S, None, False)] * 2  # not interruptible
 
@@ -84,7 +84,7 @@ def test_tiny_phase_b_budget_still_returns_a_full_grid() -> None:
     result = solve_module.solve(p, replace(PARAMS, phase_b_reserve_s=0.0))
 
     assert result.status in {SolveStatus.OPTIMAL, SolveStatus.FEASIBLE}
-    assert oracle.violations(p, result) == []
+    assert golden.violations(p, result) == []
 
 
 def test_phase_b_that_never_finishes_is_unknown_without_objective(
@@ -180,6 +180,6 @@ def test_follow_up_model_invalid_keeps_the_probe_plan_and_is_recorded(
 
     assert len(runs) == 2
     assert result.status is SolveStatus.FEASIBLE
-    assert oracle.violations(p, result) == []
+    assert golden.violations(p, result) == []
     assert result.stats.phase_a_status is not None
     assert "MODEL_INVALID" in result.stats.phase_a_status

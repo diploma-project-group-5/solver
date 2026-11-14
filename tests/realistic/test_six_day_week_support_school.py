@@ -9,7 +9,7 @@ passport of 270 (about 70 % of everyone in the building).
 What it stresses: ``school_days`` including day 6, uneven availability (5 vs 6 days), a shorter
 day with more days, and the row-day cap computed over 6 or 5 available days.
 
-The engine is checked by the independent oracle (``tests/oracle.py``), never by its own code.
+The engine is checked by the validator-lib CLI (``tests/golden.py``), never by its own code.
 """
 
 from collections import Counter
@@ -17,7 +17,7 @@ from math import ceil
 
 import pytest
 
-import oracle
+import golden
 from lad_solver.app.solve import solve
 from lad_solver.domain.problem import (
     CurriculumRow,
@@ -259,8 +259,8 @@ def test_scenario_is_realistic() -> None:
 def test_solves_within_time_limit_and_passes_oracle(solved: tuple[Problem, Result]) -> None:
     problem, result = solved
     assert result.status in {SolveStatus.OPTIMAL, SolveStatus.FEASIBLE}
-    assert oracle.violations(problem, result) == []
-    recomputed = oracle.objective(problem, result)
+    assert golden.violations(problem, result) == []
+    recomputed = golden.objective(problem, result)
     assert result.stats.objective == recomputed.value
     assert result.stats.wall_time_s < TIME_LIMIT_S + WALL_TIME_MARGIN_S
 
@@ -269,7 +269,7 @@ def test_solves_within_time_limit_and_passes_oracle(solved: tuple[Problem, Resul
 def test_passport_holds_every_day_including_saturday(solved: tuple[Problem, Result]) -> None:
     problem, result = solved
     for day in DAYS:
-        load = oracle.day_load(problem, result, day)
+        load = golden.day_load(problem, result, day)
         assert load.people <= PASSPORT, f"day {day}: {load}"
     in_person = [f for f in result.day_formats if f.in_person]
     share = len(in_person) / len(result.day_formats)

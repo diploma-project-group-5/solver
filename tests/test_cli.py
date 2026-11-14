@@ -9,8 +9,8 @@ from pathlib import Path
 
 import pytest
 
+import golden
 import lad_solver
-import oracle
 from lad_solver.adapters.kafka.mapping import MODEL_VERSION
 from lad_solver.cli.generate import generate_problem
 from lad_solver.cli.io import (
@@ -47,8 +47,8 @@ def test_generate_then_solve_round_trip(tmp_path: Path) -> None:
     problem = problem_from_json(read_json(problem_path))
     result = result_from_json(read_json(result_path))
     assert result.status in {SolveStatus.OPTIMAL, SolveStatus.FEASIBLE}
-    assert oracle.violations(problem, result) == []
-    assert result.stats.objective == oracle.objective(problem, result).value
+    assert golden.violations(problem, result) == []
+    assert result.stats.objective == golden.objective(problem, result).value
     assert json.loads(result_path.read_text(encoding="utf-8"))["status"] == result.status.value
 
 

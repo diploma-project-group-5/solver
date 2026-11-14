@@ -5,7 +5,7 @@ import time
 
 import pytest
 
-import oracle
+import golden
 from lad_solver.app import solve as solve_module
 from lad_solver.app.solve import solve
 from lad_solver.cli.generate import generate_problem
@@ -30,7 +30,7 @@ def test_stop_during_phase_a_returns_best_full_timetable() -> None:
     assert time.monotonic() - started < 10  # far below the 60 s limit
     assert result.stats.stop_reason is StopReason.STOPPED
     assert result.status is SolveStatus.FEASIBLE
-    assert oracle.violations(problem, result) == []
+    assert golden.violations(problem, result) == []
 
 
 def test_time_limit_runs_probe_then_hinted_follow_up(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -62,7 +62,7 @@ def test_time_limit_runs_probe_then_hinted_follow_up(monkeypatch: pytest.MonkeyP
         stats.wall_time_s
         < params.time_limit_s + solve_module.PHASE_B_RETRY_S * len(problem.school_days) + 1
     )
-    assert oracle.violations(problem, result) == []
+    assert golden.violations(problem, result) == []
 
 
 def test_stop_right_after_an_infeasible_capped_probe_is_not_a_proof(

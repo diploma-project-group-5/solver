@@ -12,7 +12,7 @@ their days, one format per teacher per day on the few shared days, and the bound
 ``teacher_hours_exceed_available_slots`` pre-check (14 h passes, 15 h is rejected).
 
 The problem is built deterministically; ids are opaque and PD-free. Every result is checked
-by the independent oracle (``tests/oracle.py``), never by engine code.
+by the validator-lib CLI (``tests/golden.py``), never by engine code.
 """
 
 from collections import Counter
@@ -20,7 +20,7 @@ from dataclasses import dataclass
 
 import pytest
 
-import oracle
+import golden
 from lad_solver.app.solve import solve
 from lad_solver.domain.prechecks import precheck
 from lad_solver.domain.problem import (
@@ -229,8 +229,8 @@ def test_scenario_matches_archetype_and_passes_prechecks() -> None:
 def test_builds_admissible_timetable_within_time_limit(solved: Solved) -> None:
     p, result = solved.problem, solved.result
     assert result.status in {SolveStatus.OPTIMAL, SolveStatus.FEASIBLE}
-    assert oracle.violations(p, result) == []
-    assert result.stats.objective == oracle.objective(p, result).value
+    assert golden.violations(p, result) == []
+    assert result.stats.objective == golden.objective(p, result).value
     assert result.stats.wall_time_s <= TIME_LIMIT_S + WALL_SLACK_S
     assert result.stats.first_solution_s is not None
     assert result.stats.first_solution_s < 10.0  # harsher prototype: 0.15 s
@@ -239,7 +239,7 @@ def test_builds_admissible_timetable_within_time_limit(solved: Solved) -> None:
 @pytest.mark.slow
 def test_passport_holds_every_day_and_shelter_is_used(solved: Solved) -> None:
     p, result = solved.problem, solved.result
-    loads = {d: oracle.day_load(p, result, d) for d in DAYS}
+    loads = {d: golden.day_load(p, result, d) for d in DAYS}
     assert all(x.people <= PASSPORT for x in loads.values()), loads
     students = {c.id: c.students for c in p.classes}
     in_person = [f for f in result.day_formats if f.in_person]
