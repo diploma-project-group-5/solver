@@ -4,11 +4,12 @@ Problems are derived from a randomly drawn clash-free weekly grid, so they are f
 construction: INFEASIBLE from the engine would be a bug.
 """
 
-from collections import Counter
+from collections import Counter, defaultdict
 from dataclasses import replace
 
-from hypothesis import given, settings
+from hypothesis import example, given, settings
 from hypothesis import strategies as st
+from ortools.sat.python import cp_model
 
 import golden
 from builders import OTHER, OUTSIDE, PRIO, klass, problem, row, teacher
@@ -23,7 +24,7 @@ from lad_solver.domain.problem import (
 )
 from lad_solver.domain.result import Result, SolveStatus
 from lad_solver.model.cpsat import SolverConfig
-from lad_solver.model.phase_b import DayDemand, assign_periods
+from lad_solver.model.phase_b import DayDemand, Periods, assign_day, assign_periods
 
 PARAMS = Params(time_limit_s=10, num_workers=1, random_seed=0)
 SETTINGS = settings(max_examples=40, deadline=None, derandomize=True)
@@ -190,6 +191,56 @@ def test_phase_b_is_always_feasible_for_phase_a_loads(case: tuple[int, list[DayD
             by_class[d.class_id, p] += 1
             by_teacher[d.teacher_id, p] += 1
     assert max((*by_class.values(), *by_teacher.values()), default=1) == 1
+
+
+def _gap_free_exists(lessons_per_day: int, demands: list[DayDemand]) -> bool:
+    """Oracle: a clash-free day where every class has consecutive lessons (hard constraint)."""
+    model = cp_model.CpModel()
+    periods = range(1, lessons_per_day + 1)
+    x = {(d.key, p): model.new_bool_var("") for d in demands for p in periods}
+    by_class: defaultdict[str, list[DayDemand]] = defaultdict(list)
+    by_teacher: defaultdict[str, list[DayDemand]] = defaultdict(list)
+    for d in demands:
+        model.add(sum(x[d.key, p] for p in periods) == d.count)
+        by_class[d.class_id].append(d)
+        by_teacher[d.teacher_id].append(d)
+    for group in by_teacher.values():
+        for p in periods:
+            model.add_at_most_one(x[d.key, p] for d in group)
+    for group in by_class.values():
+        k = sum(d.count for d in group)
+        starts = {s: model.new_bool_var("") for s in range(1, lessons_per_day - k + 2)}
+        model.add_exactly_one(starts.values())
+        for p in periods:  # period p is busy iff the chosen block [s, s + k) covers it
+            covering = [b for s, b in starts.items() if s <= p < s + k]
+            model.add(sum(x[d.key, p] for d in group) == sum(covering))
+    solver = cp_model.CpSolver()
+    solver.parameters.num_workers = 1
+    status = solver.solve(model)
+    assert status in {cp_model.OPTIMAL, cp_model.INFEASIBLE}
+    return status == cp_model.OPTIMAL
+
+
+def _gaps(demands: list[DayDemand], periods: Periods) -> int:
+    by_class: defaultdict[str, list[int]] = defaultdict(list)
+    for d in demands:
+        by_class[d.class_id].extend(periods[d.key])
+    return sum(max(ps) - min(ps) + 1 - len(ps) for ps in by_class.values())
+
+
+@settings(max_examples=100, deadline=None, derandomize=True)
+@given(day_loads())
+# the old objective (lessons after the k-th period) was happy with c1 at 2 and 4
+@example((4, [DayDemand(0, "c0", "t0", 1), DayDemand(1, "c1", "t0", 2)]))
+def test_phase_b_has_no_gaps_whenever_a_gap_free_day_exists(
+    case: tuple[int, list[DayDemand]],
+) -> None:
+    lessons_per_day, demands = case
+    assigned = assign_day(1, demands, lessons_per_day, config=SolverConfig(time_limit_s=5))
+    assert assigned.status is SolveStatus.OPTIMAL  # tiny days: proven, not a timeout
+    assert assigned.periods is not None  # the grid is always full, gaps or not
+    if _gap_free_exists(lessons_per_day, demands):
+        assert _gaps(demands, assigned.periods) == 0
 
 
 def test_phase_b_respects_fixed_lessons_and_hint() -> None:
