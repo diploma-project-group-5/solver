@@ -100,7 +100,8 @@ jobs:
         run: uv sync --locked
 
       - name: Integration tests (Kafka in testcontainers)
-        run: uv run pytest -m integration
+        # The image test runs in the image job, against the image built there.
+        run: uv run pytest -m "integration and not image"
 
   scenarios:
     needs: checks
@@ -153,4 +154,18 @@ jobs:
           docker run --rm --entrypoint sh lad-solver:${{ github.sha }} -c \
             'lad-solver generate --classes 3 --shelter-ratio 0.5 --out /tmp/p.json &&
              lad-solver solve --in /tmp/p.json --out /tmp/r.json --time-limit 5 --workers 1'
+
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
+        with:
+          version: "0.13.7"
+          enable-cache: true
+
+      - name: Install (locked)
+        run: uv sync --locked
+
+      # docker stop mid-solve on this image with init (tini): best timetable, exit 0 (Trello #73).
+      - name: SIGTERM on the built image
+        env:
+          SOLVER_TEST_IMAGE: lad-solver:${{ github.sha }}
+        run: uv run pytest -m image
 

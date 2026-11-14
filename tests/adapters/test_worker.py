@@ -201,6 +201,31 @@ def test_completed_that_never_flushes_logs_job_and_exits(
     assert '"level": "error"' in gave_up[0]
 
 
+def _first_solution_lines(out: str) -> list[str]:
+    return [line for line in out.splitlines() if "engine.first_solution" in line]
+
+
+def test_first_solution_is_logged_once_with_its_time(capsys: pytest.CaptureFixture[str]) -> None:
+    # Operators (and the image SIGTERM test) see when a job has a timetable to return.
+    h = harness(engine=FakeEngine(Journal(), report_solution=True))
+
+    assert h.run(encode(build_request())) == 0
+
+    [line] = _first_solution_lines(capsys.readouterr().out)
+    record = json.loads(line)
+    assert record["job_id"] == JOB_ID
+    assert isinstance(record["first_solution_ms"], int)
+    assert record["first_solution_ms"] >= 0
+
+
+def test_no_first_solution_line_without_a_solution(capsys: pytest.CaptureFixture[str]) -> None:
+    h = harness()
+
+    assert h.run(encode(build_request())) == 0
+
+    assert _first_solution_lines(capsys.readouterr().out) == []
+
+
 def test_engine_exception_becomes_model_invalid_internal() -> None:
     engine = FakeEngine(Journal(), error=NotImplementedError("engine pending"))
     h = harness(engine=engine)

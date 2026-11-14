@@ -407,10 +407,12 @@ class Worker:
     ) -> None:
         stop_deadline: float | None = None
         stall_check = True
+        announced = False
         while not future.done():
             wait([future], timeout=WAIT_SLICE_S)
             self.producer.poll(0)
             self._beat()
+            announced = announced or _announce_first_solution(progress, address)
             if stall_check:
                 stall_check = self._check_progress(progress, address)
             if self._stopping():
@@ -420,6 +422,8 @@ class Worker:
                 elif self.monotonic() > stop_deadline and not future.done():
                     jsonlog.log(ERROR, "engine.ignored_stop", **_ids(address))
                     raise WorkerFatalError
+        if not announced:
+            _announce_first_solution(progress, address)
 
     @staticmethod
     def _check_progress(progress: Progress, address: Address) -> bool:
@@ -574,3 +578,14 @@ def _ms_between(outcome: Accepted, now: datetime) -> int | None:
     if outcome.requested_at is None or outcome.requested_at.tzinfo is None:
         return None
     return round((now - outcome.requested_at).total_seconds() * 1000)
+
+
+def _announce_first_solution(progress: Progress, address: Address) -> bool:
+    """Log once that the job has a timetable to return (time to first solution)."""
+    found, started = progress.first_solution_at, progress.started
+    if found is None or started is None:
+        return False
+    jsonlog.log(
+        INFO, "engine.first_solution", **_ids(address), first_solution_ms=_ms(found - started)
+    )
+    return True

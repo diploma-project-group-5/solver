@@ -235,11 +235,14 @@ class FakeEngine:
     ignore_stop: threading.Event | None = None
     calls: list[tuple[Problem, Params]] = field(default_factory=list[tuple[Problem, Params]])
     stop_seen: bool = False
+    report_solution: bool = False  # tell progress a phase A solution exists (objective 1.0)
 
     def __call__(
         self, problem: Problem, params: Params, stop: StopHandle, progress: Progress
     ) -> Result:
-        del progress  # the fake never reports solutions
+        if self.report_solution:
+            progress.begin(None)
+            progress.record(1.0)
         self.calls.append((problem, params))
         self.journal.entries.append("solve")
         if self.ignore_stop is not None:
