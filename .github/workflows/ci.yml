@@ -43,7 +43,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7, resolved 2026-11-08
         with:
           repository: diploma-project-group-5/validator-lib
-          ref: a73552d1d46a5f7b584278c9d61d96857d620722  # tag v0.2.0
+          ref: 14e1f879e600ab1682afdf2731c9cc13566f7f4b  # tag v0.3.0
           path: _validator
           persist-credentials: false
 
@@ -143,7 +143,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7, resolved 2026-11-08
         with:
           repository: diploma-project-group-5/validator-lib
-          ref: a73552d1d46a5f7b584278c9d61d96857d620722  # tag v0.2.0
+          ref: 14e1f879e600ab1682afdf2731c9cc13566f7f4b  # tag v0.3.0
           path: _validator
           persist-credentials: false
 

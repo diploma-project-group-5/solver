@@ -37,7 +37,7 @@ with `npm ci` (its lockfile); locally the same:
 
 ```bash
 git clone https://github.com/diploma-project-group-5/validator-lib.git /tmp/validator
-git -C /tmp/validator checkout a73552d1d46a5f7b584278c9d61d96857d620722  # v0.2.0
+git -C /tmp/validator checkout 14e1f879e600ab1682afdf2731c9cc13566f7f4b  # v0.3.0
 (cd /tmp/validator && npm ci)
 export LAD_VALIDATE_CLI=/tmp/validator/dist/cli/main.js
 ```
