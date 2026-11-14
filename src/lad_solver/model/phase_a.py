@@ -81,7 +81,12 @@ def score(index: Index, plan: DayPlan) -> Score:
 
 
 def zero_day_classes(index: Index, plan: DayPlan) -> list[str]:
-    """Classes that could be in person but have no in-person day in ``plan`` (ids, input order)."""
+    """Classes that could be in person but have no in-person day in ``plan`` (ids, input order).
+
+    Classes that can never be in person (no lessons, or in 1.2 only no-shelter lessons) are left
+    out: no plan can cover them. validator-lib's ``classes_without_in_person_days`` counts them too,
+    so the two lists differ exactly by those classes.
+    """
     covered = {c for c, _ in plan.in_person}
     return [index.problem.classes[c].id for c in _coverable(index) if c not in covered]
 
