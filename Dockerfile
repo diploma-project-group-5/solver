@@ -23,7 +23,14 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # ---- runtime: no uv, no build tools, non-root ------------------------------------------------
 FROM python:3.14-slim@sha256:9aaa474097d094040649f2162a627c0049b408f52138d980916788d80f04802f AS runtime
 
-RUN groupadd --system --gid 10001 solver \
+# Security fixes the pinned base does not carry yet (trivy in CI fails on fixable HIGH/CRITICAL): pin the fixed
+# package version, drop it when a newer base digest includes it. pip is not needed at runtime and ships
+# vendored copies of urllib3/msgpack/setuptools.
+RUN apt-get update \
+ && apt-get install --only-upgrade -y --no-install-recommends zlib1g=1:1.3.dfsg+really1.3.1-1+deb13u1 \
+ && rm -rf /var/lib/apt/lists/* \
+ && python -m pip uninstall --yes pip \
+ && groupadd --system --gid 10001 solver \
  && useradd --system --uid 10001 --gid solver --no-create-home solver
 
 # Owned by root: the runtime user can read and run the venv but not rewrite its own code.

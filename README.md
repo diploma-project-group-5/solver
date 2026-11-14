@@ -32,9 +32,12 @@ Integration tests (Kafka via testcontainers) are marked `integration` and need D
 
 Results in tests are checked by the validator-lib CLI, not by Python rules (`tests/golden.py`): the timetable
 rules live in validator-lib only. The tests need Node 24 and `LAD_VALIDATE_CLI` pointing at the CLI; without it
-they fail instead of passing silently. CI installs the tag pinned in `.github/workflows/ci.yml`:
+they fail instead of passing silently. CI builds the release commit pinned in `.github/workflows/ci.yml`
+with `npm ci` (its lockfile); locally the same:
 
 ```bash
-npm install --prefix /tmp/validator "git+https://github.com/diploma-project-group-5/validator-lib.git#v0.2.0"
-export LAD_VALIDATE_CLI=/tmp/validator/node_modules/@lad/validator-lib/dist/cli/main.js
+git clone https://github.com/diploma-project-group-5/validator-lib.git /tmp/validator
+git -C /tmp/validator checkout a73552d1d46a5f7b584278c9d61d96857d620722  # v0.2.0
+(cd /tmp/validator && npm ci)
+export LAD_VALIDATE_CLI=/tmp/validator/dist/cli/main.js
 ```
