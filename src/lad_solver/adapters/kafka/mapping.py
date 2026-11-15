@@ -53,7 +53,7 @@ SCHEMA_VERSION: Final = "1.0"
 SUPPORTED_MAJOR: Final = 1
 SOURCE: Final = "solver"
 # Formulation of the CP-SAT model (ADR 2026-11-04 §1: phase A by days + phase B per day).
-MODEL_VERSION: Final = "a+a2+b/2026-11-14"
+MODEL_VERSION: Final = "a+a2+b/2026-11-15"
 
 # Fixed namespace: a re-sent event keeps its event_id, so timetable's inbox drops the duplicate.
 EVENT_NAMESPACE: Final = UUID("5a0c6f2e-9d1b-4c3a-8e7f-6b5d4c3a2e1f")
