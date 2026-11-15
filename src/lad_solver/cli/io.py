@@ -26,6 +26,7 @@ from lad_solver.domain.result import (
     CapacityCondition,
     Conflict,
     ConflictRule,
+    CoverageVerdict,
     DayFormat,
     Lesson,
     Result,
@@ -183,6 +184,8 @@ def _stats(o: Json) -> Stats:
     best_bound = o.get("best_bound")
     first = o.get("first_solution_s")
     last = o.get("last_improvement_s")
+    verdict = _opt_str(o, "coverage_verdict")
+    coverage = _opt_str(o, "coverage_status")
     return Stats(
         objective=_opt_int(o, "objective"),
         best_bound=None if best_bound is None else _float(best_bound, "best_bound"),
@@ -196,6 +199,12 @@ def _stats(o: Json) -> Stats:
         stop_reason=StopReason(_str(o, "stop_reason")),
         num_workers=_int(o, "num_workers"),
         random_seed=_int(o, "random_seed"),
+        # Added after 0.2.0: an older result file has none of them.
+        coverage_verdict=None if verdict is None else CoverageVerdict(verdict),
+        coverage_status=None if coverage is None else SolveStatus(coverage),
+        zero_day_before=_opt_int(o, "zero_day_before"),
+        zero_day_after=_opt_int(o, "zero_day_after"),
+        phase_b_retry_days=_int(o, "phase_b_retry_days") if "phase_b_retry_days" in o else 0,
     )
 
 

@@ -12,8 +12,9 @@
 #   solve.build.requested            timetable -> solver
 #   solve.build.requested.dlq        solver diagnostics only, never replayed (retention.ms=1209600000)
 #   solve.status                     solver -> timetable (solve.started, solve.completed)
-#   solve.substitution.requested     stage 2; the solver does not subscribe to it yet
-#   solve.substitution.requested.dlq stage 2
+#   solve.substitution.requested     timetable -> solver; until the stage 2 engine every job is
+#                                    answered at once with MODEL_INVALID / unsupported_job_type
+#   solve.substitution.requested.dlq solver diagnostics only, never replayed (retention.ms=1209600000)
 #
 # timetable side (not here): default time limit 60 s (build) / 15 s (substitution);
 # run_deadline_at = started_at + limit + >= 90 s; queue_deadline_at >= creation + 10 min.
@@ -37,6 +38,8 @@ services:
       SOLVER_BUILD_TOPIC: solve.build.requested
       SOLVER_STATUS_TOPIC: solve.status
       SOLVER_BUILD_DLQ_TOPIC: solve.build.requested.dlq
+      SOLVER_SUBSTITUTION_TOPIC: solve.substitution.requested        # default; same consumer group
+      SOLVER_SUBSTITUTION_DLQ_TOPIC: solve.substitution.requested.dlq  # default
       SOLVER_MIN_TIME_LIMIT_S: "10"
       SOLVER_MAX_TIME_LIMIT_S: "180"
       SOLVER_NUM_WORKERS: "2"

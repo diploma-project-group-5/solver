@@ -105,3 +105,39 @@ def test_production_engine_passes_stop_and_progress_to_solve(
 
     assert result.status is SolveStatus.UNKNOWN
     assert calls == [(outcome.problem, params, stop, progress)]
+
+
+class _IdleWorker:
+    def __init__(self, **_kwargs: object) -> None:
+        pass
+
+    def request_stop(self, _signal_name: str = "SIGTERM") -> None:
+        pass
+
+    def run(self) -> int:
+        return 0
+
+
+def test_worker_subscribes_to_build_and_substitution_topics(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    subscribed: list[list[str]] = []
+
+    def consumer(_config: object, topics: list[str]) -> _Closable:
+        subscribed.append(topics)
+        return _Closable()
+
+    monkeypatch.setattr(worker_main, "KafkaConsumer", consumer)
+    monkeypatch.setattr(worker_main, "KafkaProducer", _Closable)
+    monkeypatch.setattr(worker_main, "Worker", _IdleWorker)
+    saved = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGINT)}
+    try:
+        assert worker_main.run(ENV) == 0
+    finally:
+        for s, handler in saved.items():
+            signal.signal(s, handler)
+
+    assert subscribed == [["solve.build.requested", "solve.substitution.requested"]]
+    lines = [json.loads(x) for x in capsys.readouterr().out.splitlines()]
+    [ready] = [x for x in lines if x["msg"] == "worker.ready"]
+    assert ready["topics"] == ["solve.build.requested", "solve.substitution.requested"]

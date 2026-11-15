@@ -3,6 +3,9 @@
 CP-SAT solver for «Лад»: builds the main timetable (capacity model 1.1), the alert timetable (model 1.2)
 and substitution proposals. Runs as a Kafka worker (`solve.build.requested`, `solve.substitution.requested`
 → `solve.status`) and ships the `bench` evaluation CLI.
+Until the stage 2 substitution engine, every `solve.substitution.requested` job is answered at once with
+`solve.completed` MODEL_INVALID / `error.code=unsupported_job_type` (no `solve.started`; a broken message goes to
+`solve.substitution.requested.dlq`) — ADR 2026-11-15.
 
 ## Layout
 
@@ -15,6 +18,11 @@ src/lad_solver/
   cli/       bench
 tests/       pytest + hypothesis; `test_architecture.py` enforces the layering
 ```
+
+Logs: only the worker logs, as JSON lines on stdout with an allow-list of fields
+(`adapters/kafka/jsonlog.py`); job ids come from the job context, also in the solve thread. The engine
+(`domain`, `model`, `app`) has no `logging`: it reports through `Stats` (e.g. the coverage step verdict and
+the phase B retry days, counts only), which the worker writes to `job.completed`.
 
 ## Development
 
