@@ -4,8 +4,11 @@ The lyceum of ``_lyceum`` (50 classes, ~1300 pupils) with mathematics as its onl
 (s-math, s-alg, s-geom): every class has those lessons, so no class is a static orphan, yet only
 300 equipped seats for the pupils leave some classes without an in-person day after the ladder
 ("dynamic orphans"). That is where the coverage step used to get no time on the wall clock: the
-ladder kept the whole phase A budget (8 such classes on 90 s, the step never ran), and with the
-reserve the step brings them down (6 -> 2, ADR 2026-11-14, addendum 2026-11-15). On the 1.1
+ladder kept the whole phase A budget and the step never ran (ADR 2026-11-14, addendum 2026-11-15:
+8 such classes on 90 s of wall clock, 6 -> 2 with the reserve). This scenario runs on a
+deterministic budget, where the step already had its share before the fix, so it is a regression
+gate for the step on a large school, not for the wall-clock bug; the frozen-clock unit tests of
+``test_engine_coverage`` are that gate. On the 1.1
 timetable the 700-person passport covers every class even with this list, so 1.2 it is.
 
 A deterministic budget and one worker keep the result reproducible (wall-clock counts would make
@@ -39,8 +42,9 @@ PARAMS = Params(
 )
 PRIORITY_AREA = frozenset({"s-math", "s-alg", "s-geom"})
 SEATS, PASSPORT = 300, 700
-# Measured on macOS arm64, OR-Tools 9.15.6755: the step took the ladder's 11 classes to 10.
-MAX_WITHOUT_IN_PERSON = 10
+# OR-Tools 9.15.6755, det 10, seed 0: macOS arm64 11 -> 10, linux x86_64 (CI) 15 -> 14.
+# The bound is the larger of the two, without slack; recalibrate on an OR-Tools update.
+MAX_WITHOUT_IN_PERSON = 14
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,3 +102,7 @@ def test_coverage_step_improves_a_large_school_without_static_orphans(solved: So
     assert after < before, run  # ... and its plan was taken
     zero_day = golden.classes_without_in_person_days(solved.problem, solved.result)
     assert len(zero_day) == after <= MAX_WITHOUT_IN_PERSON, (run, zero_day)
+    wall = solved.result.stats.wall_time_s
+    assert wall < TIME_LIMIT_S / 2, (
+        f"wall clock hit ({wall:.1f} s): the result depends on the machine"
+    )

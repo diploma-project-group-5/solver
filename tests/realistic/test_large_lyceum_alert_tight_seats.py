@@ -42,9 +42,9 @@ PARAMS = Params(
     max_deterministic_time=DETERMINISTIC_S,
 )
 SEATS, PASSPORT = 300, 370
-# Measured on macOS arm64, OR-Tools 9.15.6755: 14 classes after the ladder, 13 after the step.
-# Not yet measured on linux x86_64 (CI): calibrate to the larger of the two, without slack.
-MAX_WITHOUT_IN_PERSON = 13
+# OR-Tools 9.15.6755, det 10, seed 0: macOS arm64 14 -> 13, linux x86_64 (CI) 15 -> 14.
+# The bound is the larger of the two, without slack; recalibrate on an OR-Tools update.
+MAX_WITHOUT_IN_PERSON = 14
 FOUND = frozenset({SolveStatus.OPTIMAL, SolveStatus.FEASIBLE})
 
 

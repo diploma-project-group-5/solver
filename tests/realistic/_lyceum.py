@@ -1,4 +1,4 @@
-"""The large city lyceum of the realistic scenarios: 50 classes, ~1300 pupils, 77 teachers.
+"""The large city lyceum of the realistic scenarios: 50 classes, 1281 pupils, 75 teachers, 30 staff.
 
 Shared by the scenarios built on it (1.1 performance, poor priority list); the data and ``SEED``
 are those of ``test_large_city_lyceum_performance`` and must not change silently: every scenario
