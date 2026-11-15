@@ -1,6 +1,6 @@
 [project]
 name = "lad-solver"
-version = "0.3.0"
+version = "0.4.0"
 description = "Lad timetable solver: CP-SAT worker for main/alert timetables and substitutions, plus the bench CLI."
 authors = [{ name = "Roman Osovyk", email = "r.osovyk@gmail.com" }]
 readme = "README.md"
