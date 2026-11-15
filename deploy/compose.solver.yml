@@ -12,8 +12,8 @@
 #   solve.build.requested            timetable -> solver
 #   solve.build.requested.dlq        solver diagnostics only, never replayed (retention.ms=1209600000)
 #   solve.status                     solver -> timetable (solve.started, solve.completed)
-#   solve.substitution.requested     timetable -> solver; until the stage 2 engine every job is
-#                                    answered at once with MODEL_INVALID / unsupported_job_type
+#   solve.substitution.requested     timetable -> solver; solved by the stage 2 engine (>= 0.4.0):
+#                                    solve.started, then solve.completed with data.substitution
 #   solve.substitution.requested.dlq solver diagnostics only, never replayed (retention.ms=1209600000)
 #
 # timetable side (not here): default time limit 60 s (build) / 15 s (substitution);
