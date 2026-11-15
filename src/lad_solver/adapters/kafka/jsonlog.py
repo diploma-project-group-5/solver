@@ -2,16 +2,24 @@
 
 Only identifiers, statuses, sizes and durations pass (spec §13, personal-data rules): a field that
 is not in ``ALLOWED_FIELDS`` is dropped, so a careless call cannot leak a payload.
+
+The handler sits on the package logger ``lad_solver``: every ``lad_solver.*`` logger goes through
+the same allow-list (never Python's lastResort on stderr). Inside ``job_context`` each line gets
+the job's ids, also from the solve thread when it was started with ``contextvars.copy_context()``.
 """
 
 import json
 import logging
 import sys
 import traceback
+from collections.abc import Generator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import UTC, datetime
 from pathlib import PurePath
 from typing import Final, TextIO, override
 
+ROOT_LOGGER: Final = "lad_solver"
 LOGGER_NAME: Final = "lad_solver.worker"
 
 ALLOWED_FIELDS: Final = frozenset(
@@ -53,6 +61,12 @@ ALLOWED_FIELDS: Final = frozenset(
         "stall_ratio",
         "max_memory_mb",
         "group_id",
+        # coverage step and phase B summary (ADR 2026-11-14): counts and enum values, no ids
+        "coverage_verdict",
+        "coverage_status",
+        "zero_day_before",
+        "zero_day_after",
+        "phase_b_retry_days",
     }
 )
 
@@ -60,6 +74,8 @@ _PACKAGE: Final = "lad_solver"
 _WHERE_FRAMES: Final = 3
 
 _EXTRA_KEY: Final = "lad_fields"
+
+_JOB: ContextVar[Mapping[str, object] | None] = ContextVar("lad_solver_job", default=None)
 
 
 class JsonFormatter(logging.Formatter):
@@ -71,12 +87,16 @@ class JsonFormatter(logging.Formatter):
             "logger": record.name,
             "msg": record.msg if isinstance(record.msg, str) else "?",
         }
-        fields: object = getattr(record, _EXTRA_KEY, None)
-        if isinstance(fields, dict):
-            for key, value in fields.items():  # pyright: ignore[reportUnknownVariableType]
+        # The job context first, then the call's own fields (a non-None value overrides the
+        # context). Both pass the same allow-list; None is never written.
+        for source in (_JOB.get(), getattr(record, _EXTRA_KEY, None)):
+            if not isinstance(source, Mapping):
+                continue
+            for key, value in source.items():  # pyright: ignore[reportUnknownVariableType]
                 if key in ALLOWED_FIELDS and value is not None:
                     entry[str(key)] = value  # pyright: ignore[reportUnknownArgumentType]
-        # Deliberately no record.exc_info / exc_text: exception messages may quote input.
+        # Deliberately no record.args (``getMessage()``) and no record.exc_info / exc_text:
+        # formatting arguments and exception messages may quote input.
         return json.dumps(entry, ensure_ascii=False, default=str)
 
 
@@ -90,14 +110,29 @@ class _StdoutHandler(logging.StreamHandler[TextIO]):
 
 
 def configure(stream: TextIO | None = None, level: int = logging.INFO) -> logging.Logger:
-    logger = logging.getLogger(LOGGER_NAME)
-    logger.handlers.clear()
+    """One JSON handler on ``lad_solver``; idempotent (a second call replaces the first)."""
+    root = logging.getLogger(ROOT_LOGGER)
+    root.handlers.clear()
     handler = logging.StreamHandler(stream) if stream is not None else _StdoutHandler()
     handler.setFormatter(JsonFormatter())
-    logger.addHandler(handler)
-    logger.setLevel(level)
-    logger.propagate = False
-    return logger
+    root.addHandler(handler)
+    root.setLevel(level)
+    root.propagate = False
+    worker = logging.getLogger(LOGGER_NAME)
+    worker.handlers.clear()  # a handler left here by an older configure() would duplicate lines
+    worker.setLevel(logging.NOTSET)
+    worker.propagate = True
+    return worker
+
+
+@contextmanager
+def job_context(*, job_id: str, school_id: str, correlation_id: str | None) -> Generator[None]:
+    """Every line logged inside the block (this thread, or a copied context) carries the ids."""
+    token = _JOB.set({"job_id": job_id, "school_id": school_id, "correlation_id": correlation_id})
+    try:
+        yield
+    finally:
+        _JOB.reset(token)
 
 
 def log(level: int, event: str, **fields: object) -> None:

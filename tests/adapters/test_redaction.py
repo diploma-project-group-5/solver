@@ -5,6 +5,7 @@ It must not appear in stdout/stderr, exception texts, DLQ messages or outgoing e
 """
 
 import json
+import logging
 from typing import Any
 
 import pytest
@@ -23,6 +24,7 @@ from kafka_support import (
 )
 from pydantic import ValidationError
 
+from lad_solver.adapters.kafka import jsonlog
 from lad_solver.adapters.kafka.payload import BuildRequested
 
 MARKER = "Іваненко-MARKER-7f3a"  # Cyrillic on purpose: non-ASCII must not slip through
@@ -184,3 +186,30 @@ def test_where_names_code_locations_only(capsys: pytest.CaptureFixture[str]) -> 
             assert module.startswith("lad_solver.")
             assert function.isidentifier()
             assert line.isdigit()
+
+
+def test_secrets_and_bodies_passed_to_a_logger_are_dropped(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # A careless call that hands a logger request headers, a body or a temporary password
+    # (personal-data rules): neither the allow-list nor %-formatting lets the value through.
+    secret = f"Bearer {MARKER}"
+    jsonlog.log(
+        logging.ERROR,
+        "job.completed",
+        job_id="j-1",
+        Authorization=secret,
+        authorization=secret,
+        x_access_token=secret,
+        headers={"Authorization": secret, "X-Access-Token": secret},
+        body=secret,
+        temporary_password=MARKER,
+    )
+    engine = logging.getLogger("lad_solver.app.redaction")
+    engine.warning("engine.event", extra={"Authorization": secret, "X-Access-Token": secret})
+    engine.info("engine.event %s", secret)
+    engine.error("engine.event %(body)s", {"body": secret})
+
+    out, err = capsys.readouterr()
+    assert MARKER not in out + err
+    assert len(out.splitlines()) == 4  # every call was written, only without the values

@@ -16,13 +16,16 @@ never redelivered; timetable's watchdog closes the job by run_deadline_at (spec 
 Only transient produce/commit failures are retried (1/2/4 s); a solve is never retried.
 """
 
+import contextvars
 import os
 import threading
 import time
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future, wait
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from enum import StrEnum
 from logging import ERROR, INFO, WARNING
 from typing import Final
 
@@ -75,6 +78,7 @@ POLL_TIMEOUT_S: Final = 1.0
 WAIT_SLICE_S: Final = 0.5
 # Consecutive failed consumer polls after which the heartbeat file goes stale (unhealthy).
 MAX_CONSUMER_ERRORS: Final = 30
+_IMPOSSIBLE_COVERAGE: Final = frozenset({SolveStatus.INFEASIBLE, SolveStatus.MODEL_INVALID})
 
 EXIT_OK: Final = 0
 EXIT_FAILURE: Final = 1
@@ -249,19 +253,20 @@ class Worker:
         except Exception as exc:  # noqa: BLE001 -- a parser bug must not crash-loop on one message
             outcome = self._parser_failed(message, exc)
         self._current = None if isinstance(outcome, Poison) else outcome.address
-        match outcome:
-            case Poison(error_class=error_class):
-                self._on_poison(message, route, error_class)
-            case Rejected():
-                self._on_rejected(message, route, outcome)
-            case Unsupported():
-                self._on_unsupported(message, outcome)
-            case Accepted():
-                now = self.clock()
-                if outcome.queue_deadline_at <= now:
-                    self._on_expired(message, outcome, now)
-                else:
-                    self._on_accepted(message, outcome, now)
+        with _job_context(self._current):
+            match outcome:
+                case Poison(error_class=error_class):
+                    self._on_poison(message, route, error_class)
+                case Rejected():
+                    self._on_rejected(message, route, outcome)
+                case Unsupported():
+                    self._on_unsupported(message, outcome)
+                case Accepted():
+                    now = self.clock()
+                    if outcome.queue_deadline_at <= now:
+                        self._on_expired(message, outcome, now)
+                    else:
+                        self._on_accepted(message, outcome, now)
         self._last, self._current = self._current or self._last, None
 
     def _route(self, message: InboundMessage) -> Route:
@@ -387,6 +392,14 @@ class Worker:
             self._log_completed(address, completed, wall_time_ms=wall_time_ms)
             return
         stats = result.stats
+        if stats.coverage_status in _IMPOSSIBLE_COVERAGE:
+            # A hinted feasible model cannot be INFEASIBLE / MODEL_INVALID: an engine bug.
+            jsonlog.log(
+                WARNING,
+                "engine.coverage_anomaly",
+                **_ids(address),
+                coverage_status=_value(stats.coverage_status),
+            )
         self._log_completed(
             address,
             completed,
@@ -400,6 +413,11 @@ class Worker:
             quality_relaxed=stats.quality_relaxed,
             phase_a_status=stats.phase_a_status,
             num_workers=stats.num_workers,
+            coverage_verdict=_value(stats.coverage_verdict),
+            coverage_status=_value(stats.coverage_status),
+            zero_day_before=stats.zero_day_before,
+            zero_day_after=stats.zero_day_after,
+            phase_b_retry_days=stats.phase_b_retry_days,
         )
 
     @staticmethod
@@ -437,8 +455,11 @@ class Worker:
                 future.set_exception(exc)
 
         # A daemon thread instead of ThreadPoolExecutor: executor threads are joined at
-        # interpreter exit, so a stuck CP-SAT search would block a fatal exit.
-        solver_thread = threading.Thread(target=target, name="lad-solve", daemon=True)
+        # interpreter exit, so a stuck CP-SAT search would block a fatal exit. The copied
+        # context carries the job ids (jsonlog.job_context) to anything logged in the thread.
+        solver_thread = threading.Thread(
+            target=target, name="lad-solve", daemon=True, context=contextvars.copy_context()
+        )
         watchdog = threading.Timer(
             params.time_limit_s + self.config.watchdog_margin_s, self._watchdog, args=(address,)
         )
@@ -622,6 +643,21 @@ def _ids(address: Address | None) -> dict[str, object]:
         "school_id": str(address.school_id),
         "correlation_id": address.correlation_id,
     }
+
+
+def _job_context(address: Address | None) -> AbstractContextManager[None]:
+    """Job ids on every line logged while the message is handled; none for a poison message."""
+    if address is None:
+        return nullcontext()
+    return jsonlog.job_context(
+        job_id=str(address.job_id),
+        school_id=str(address.school_id),
+        correlation_id=address.correlation_id,
+    )
+
+
+def _value(member: StrEnum | None) -> str | None:
+    return None if member is None else member.value
 
 
 def _reason(exc: TransientKafkaError) -> str | None:

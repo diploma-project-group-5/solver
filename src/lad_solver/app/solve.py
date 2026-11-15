@@ -6,7 +6,6 @@ objective kept) -> phase B (lesson numbers, one small model per day) -> ``Result
 The time limit covers everything; phase B keeps a reserve of ``min(15 s, 0.15 T)``.
 """
 
-import logging
 import time
 from collections import Counter
 from dataclasses import dataclass, replace
@@ -16,6 +15,7 @@ from lad_solver.domain.problem import Params, Problem
 from lad_solver.domain.result import (
     Conflict,
     ConflictRule,
+    CoverageVerdict,
     DayFormat,
     Lesson,
     Result,
@@ -38,8 +38,6 @@ from lad_solver.model.phase_a import (
 from lad_solver.model.phase_b import DayAssignment, DayDemand, assign_day
 from lad_solver.model.progress import Progress, StallPolicy
 from lad_solver.model.stop import StopHandle
-
-_log = logging.getLogger(__name__)
 
 PROBE_SHARE = 0.25  # no phase A solution within this share of its budget -> drop the row cap
 # Coverage step (ADR 2026-11-14) runs for at most min(10 s, 0.15 of the phase A budget), or 0.15 of
@@ -74,6 +72,17 @@ class _PhaseA:
     stalled: bool = False  # stopped by the no-improvement rule (ADR 2026-11-08)
     first_solution_at: float | None = None  # time.monotonic(), from Progress
     last_improvement_at: float | None = None  # time.monotonic(), from Progress
+    # What the coverage step did (Stats telemetry; None: no plan, so the step was not considered)
+    coverage_verdict: CoverageVerdict | None = None
+    coverage_status: SolveStatus | None = None
+    zero_day_before: int | None = None
+    zero_day_after: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _PhaseB:
+    outcome: tuple[Lesson, ...] | SolveStatus  # all lessons, or the status of the failed day
+    retry_days: int  # days that ran the feasibility-only retry
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,7 +136,8 @@ def solve(
 
     day_limit = min(PHASE_B_DAY_MAX_S, reserve_b / len(problem.school_days))
     end = started + params.time_limit_s
-    lessons = _run_phase_b(index, a.plan, params, stop, day_limit, end=end)
+    b = _run_phase_b(index, a.plan, params, stop, day_limit, end=end)
+    lessons = b.outcome
     sc = score(index, a.plan)
     stats = _stats(
         params,
@@ -138,6 +148,7 @@ def solve(
         primary=sc.primary,
         secondary=sc.secondary,
         phase_a=a,
+        phase_b_retry_days=b.retry_days,
     )
     if isinstance(lessons, SolveStatus):
         # No grid: the phase A objective describes nothing that is returned.
@@ -304,7 +315,7 @@ def _better(
     return _PhaseA(SolveStatus.FEASIBLE, probe_plan, bound, relaxed=False, caps=caps, note=note)
 
 
-def _cover(
+def _cover(  # noqa: PLR0911 - one exit per coverage verdict
     index: Index, a: _PhaseA, params: Params, stop: StopHandle | None, budget: _Budget
 ) -> _PhaseA:
     """Coverage step (ADR 2026-11-14) on the ladder's plan; the plan it returns may replace it.
@@ -314,41 +325,32 @@ def _cover(
     The new plan is taken only with strictly fewer classes without an in-person day and an
     objective >= the floor; anything else (no plan, a stop) keeps the ladder's plan. Status,
     bound and stop reason stay the ladder's; ``solve`` rescores the objective from the plan.
+    The verdict and the counts (no class ids) go to ``Stats``; the worker logs them.
     """
-    if a.plan is None or _is_stopped(stop):
+    if a.plan is None:
         return a
+    if _is_stopped(stop):
+        return replace(a, coverage_verdict=CoverageVerdict.STOPPED)
     before = zero_day_classes(index, a.plan)
+    if not before:
+        return replace(a, coverage_verdict=CoverageVerdict.NOT_NEEDED, zero_day_before=0)
     now = time.monotonic()
     end = budget.end(now)
     left = end - now
-    if not before or left <= MIN_RUN_S:
-        return a
+    if left <= MIN_RUN_S:
+        return replace(a, coverage_verdict=CoverageVerdict.NO_TIME, zero_day_before=len(before))
     floor = score(index, a.plan).objective
     config = _config(params, left, budget.det)
     outcome = solve_coverage(index, a.caps, a.plan, floor, config, stop=stop, deadline=end)
-    status = outcome.info.status
+    ran = replace(a, coverage_status=outcome.info.status, zero_day_before=len(before))
     if outcome.plan is None or _is_stopped(stop):
-        _log_coverage("kept", status, len(before), None)
-        return a
+        verdict = CoverageVerdict.STOPPED if _is_stopped(stop) else CoverageVerdict.KEPT
+        return replace(ran, coverage_verdict=verdict)
     after = zero_day_classes(index, outcome.plan)
+    ran = replace(ran, zero_day_after=len(after))
     if len(after) >= len(before) or score(index, outcome.plan).objective < floor:
-        _log_coverage("kept", status, len(before), len(after))
-        return a
-    _log_coverage("accepted", status, len(before), len(after))
-    return replace(a, plan=outcome.plan)
-
-
-def _log_coverage(verdict: str, status: SolveStatus, before: int, after: int | None) -> None:
-    """Counts and statuses only. A hinted feasible model cannot be INFEASIBLE / MODEL_INVALID."""
-    broken = status in {SolveStatus.INFEASIBLE, SolveStatus.MODEL_INVALID}
-    _log.log(
-        logging.WARNING if broken else logging.INFO,
-        "coverage step %s (%s): classes without an in-person day %d -> %s",
-        verdict,
-        status.value,
-        before,
-        "-" if after is None else after,
-    )
+        return replace(ran, coverage_verdict=CoverageVerdict.KEPT)
+    return replace(ran, coverage_verdict=CoverageVerdict.ACCEPTED, plan=outcome.plan)
 
 
 def _no_plan(index: Index, params: Params, started: float, a: _PhaseA, *, stopped: bool) -> Result:
@@ -389,10 +391,11 @@ def _run_phase_b(  # noqa: PLR0913 - keyword-only overall deadline
     day_limit: float,
     *,
     end: float,
-) -> tuple[Lesson, ...] | SolveStatus:
-    """All lessons, or the status of the first day that got no assignment."""
+) -> _PhaseB:
+    """All lessons, or the status of the first day that got no assignment; with the retry days."""
     rows = index.problem.rows
     lessons: list[Lesson] = []
+    retry_days = 0
     for day in index.days:
         demands = [
             DayDemand(r, rows[r].class_id, rows[r].teacher_id, n)
@@ -401,17 +404,20 @@ def _run_phase_b(  # noqa: PLR0913 - keyword-only overall deadline
         ]
         if not demands:
             continue
-        assigned = _assign_day(
+        assigned, retried = _assign_day(
             day, demands, index.lessons_per_day, params, stop=stop, limit=day_limit, end=end
         )
+        retry_days += retried
         if assigned.periods is None:
-            return assigned.status
+            return _PhaseB(assigned.status, retry_days)
         lessons.extend(
             Lesson(rows[r].class_id, day, p, rows[r].subject_id, rows[r].teacher_id)
             for r, ps in assigned.periods.items()
             for p in ps
         )
-    return tuple(sorted(lessons, key=lambda x: (x.class_id, x.day, x.lesson_no)))
+    return _PhaseB(
+        tuple(sorted(lessons, key=lambda x: (x.class_id, x.day, x.lesson_no))), retry_days
+    )
 
 
 def _assign_day(  # noqa: PLR0913 - keyword-only stop/limit
@@ -423,8 +429,10 @@ def _assign_day(  # noqa: PLR0913 - keyword-only stop/limit
     stop: StopHandle | None,
     limit: float,
     end: float,
-) -> DayAssignment:
+) -> tuple[DayAssignment, bool]:
     """Compact model within ``limit``; on timeout (or stop) one feasibility-only retry.
+
+    The flag is True when the retry ran.
 
     At most two CP-SAT runs per day (``fallback=False``): ``limit + PHASE_B_RETRY_S``. With a
     deterministic budget the runs get ``PHASE_B_DAY_DET`` / ``PHASE_B_RETRY_DET`` instead, and the
@@ -443,13 +451,13 @@ def _assign_day(  # noqa: PLR0913 - keyword-only stop/limit
     if not _is_stopped(stop):
         first = assign_day(day, demands, lessons_per_day, config=config, stop=stop, fallback=False)
         if first.periods is not None or first.status is not SolveStatus.UNKNOWN:
-            return first  # found, or a proven failure that a retry cannot fix
+            return first, False  # found, or a proven failure that a retry cannot fix
     retry = (
         config.with_time(_remaining(end), PHASE_B_RETRY_DET)
         if deterministic
         else config.with_time(PHASE_B_RETRY_S)
     )
-    return assign_day(day, demands, lessons_per_day, config=retry, compact=False)
+    return assign_day(day, demands, lessons_per_day, config=retry, compact=False), True
 
 
 def _is_stopped(stop: StopHandle | None) -> bool:
@@ -485,6 +493,7 @@ def _stats(  # noqa: PLR0913
     primary: int | None = None,
     secondary: int | None = None,
     phase_a: _PhaseA | None = None,
+    phase_b_retry_days: int = 0,
 ) -> Stats:
     return Stats(
         objective=objective,
@@ -501,6 +510,11 @@ def _stats(  # noqa: PLR0913
         stop_reason=stop_reason,
         num_workers=params.num_workers,
         random_seed=params.random_seed,
+        coverage_verdict=None if phase_a is None else phase_a.coverage_verdict,
+        coverage_status=None if phase_a is None else phase_a.coverage_status,
+        zero_day_before=None if phase_a is None else phase_a.zero_day_before,
+        zero_day_after=None if phase_a is None else phase_a.zero_day_after,
+        phase_b_retry_days=phase_b_retry_days,
     )
 
 
