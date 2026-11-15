@@ -143,11 +143,8 @@ def _no_classes(*_args: object) -> list[str]:
 def test_coverage_step_keeps_the_phase_a_objective_and_status(p: Problem) -> None:
     """The coverage step (ADR 2026-11-14) never trades the objective for in-person days."""
     final = _optimal(p)
-    # Phase A alone, as before the coverage step: no time reserve and no second run.
-    with (
-        mock.patch.object(solve_module, "static_orphans", _no_classes),
-        mock.patch.object(solve_module, "zero_day_classes", _no_classes),
-    ):
+    # Phase A alone: the ladder with the same budget, its reserve unused, no coverage step.
+    with mock.patch.object(solve_module, "zero_day_classes", _no_classes):
         step1 = _optimal(p)
     assert final.status is step1.status
     assert _objective(final) >= _objective(step1)
