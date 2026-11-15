@@ -40,6 +40,16 @@ class StopReason(StrEnum):
     PRECHECK = "precheck"  # rejected before CP-SAT
 
 
+class CoverageVerdict(StrEnum):
+    """What the coverage step (ADR 2026-11-14) did with the ladder's plan."""
+
+    NOT_NEEDED = "not_needed"  # every class already has an in-person day
+    NO_TIME = "no_time"  # the ladder left no time for the run
+    STOPPED = "stopped"  # external stop before or during the run: the ladder's plan stays
+    KEPT = "kept"  # the run found no better plan: the ladder's plan stays
+    ACCEPTED = "accepted"  # fewer classes without an in-person day, objective kept
+
+
 @dataclass(frozen=True, slots=True)
 class Conflict:
     rule: ConflictRule
@@ -81,6 +91,12 @@ class Stats:
     stop_reason: StopReason = StopReason.COMPLETED
     num_workers: int = 0
     random_seed: int = 0
+    # Engine telemetry for the worker logs, not part of solve.completed: counts and enums only.
+    coverage_verdict: CoverageVerdict | None = None  # None: phase A found no plan
+    coverage_status: SolveStatus | None = None  # status of the coverage run, if it ran
+    zero_day_before: int | None = None  # classes without an in-person day before the step
+    zero_day_after: int | None = None  # ... in the plan the run found (None: no plan)
+    phase_b_retry_days: int = 0  # days on which phase B ran the feasibility-only retry
 
 
 @dataclass(frozen=True, slots=True)

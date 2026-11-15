@@ -14,8 +14,11 @@ FORBIDDEN: dict[str, tuple[str, ...]] = {
 }
 
 # The engine stays pure and single-threaded: no transport, validation frameworks or threads.
+# No logging either: the engine reports through Stats, and only the worker writes (allow-listed)
+# JSON logs, so a log call in the engine cannot quote input data (personal-data rules).
 FORBIDDEN_THIRD_PARTY = (
     "confluent_kafka",
+    "logging",
     "pydantic",
     "jsonschema",
     "signal",

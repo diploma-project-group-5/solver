@@ -28,6 +28,7 @@ from lad_solver.domain.result import (
     CapacityCondition,
     Conflict,
     ConflictRule,
+    CoverageVerdict,
     DayFormat,
     Lesson,
     Result,
@@ -115,9 +116,37 @@ def test_result_json_round_trip() -> None:
             stop_reason=StopReason.NO_IMPROVEMENT,
             num_workers=2,
             random_seed=7,
+            coverage_verdict=CoverageVerdict.KEPT,
+            coverage_status=SolveStatus.UNKNOWN,
+            zero_day_before=3,
+            zero_day_after=None,
+            phase_b_retry_days=2,
         ),
     )
     assert result_from_json(result_to_json(result)) == result
+
+
+def test_result_json_of_0_2_0_without_the_coverage_summary_still_reads() -> None:
+    data = result_to_json(Result(SolveStatus.FEASIBLE, stats=Stats(num_workers=2)))
+    stats = data["stats"]
+    assert isinstance(stats, dict)
+    for key in (
+        "coverage_verdict",
+        "coverage_status",
+        "zero_day_before",
+        "zero_day_after",
+        "phase_b_retry_days",
+    ):
+        del stats[key]
+
+    parsed = result_from_json(data).stats
+
+    assert (parsed.coverage_verdict, parsed.coverage_status) == (None, None)
+    assert (parsed.zero_day_before, parsed.zero_day_after, parsed.phase_b_retry_days) == (
+        None,
+        None,
+        0,
+    )
 
 
 @pytest.mark.parametrize(
