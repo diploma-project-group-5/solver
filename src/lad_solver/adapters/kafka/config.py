@@ -9,6 +9,8 @@ from pathlib import Path
 # Topics are created by platform/kafka-init (auto.create.topics.enable=false).
 DEFAULT_BUILD_TOPIC = "solve.build.requested"
 DEFAULT_STATUS_TOPIC = "solve.status"
+# Consumed by the same group; until the stage 2 engine every job is refused (ADR 2026-11-15).
+DEFAULT_SUBSTITUTION_TOPIC = "solve.substitution.requested"
 
 
 # Must stay below the producer's message.max.bytes (librdkafka default 1,000,000): the key,
@@ -35,6 +37,8 @@ class WorkerConfig:
     build_topic: str = DEFAULT_BUILD_TOPIC
     status_topic: str = DEFAULT_STATUS_TOPIC
     build_dlq_topic: str = f"{DEFAULT_BUILD_TOPIC}.dlq"
+    substitution_topic: str = DEFAULT_SUBSTITUTION_TOPIC
+    substitution_dlq_topic: str = f"{DEFAULT_SUBSTITUTION_TOPIC}.dlq"
     min_time_limit_s: int = 10
     max_time_limit_s: int = 180
     num_workers: int = 2  # ADR 2026-11-04 §3 as amended by ADR 2026-11-08 (cpus 1.5)
@@ -64,6 +68,18 @@ class WorkerConfig:
     def completed_flush_timeout_s(self) -> float:
         return self.delivery_timeout_ms / 1000 + 5
 
+    @property
+    def consumed_topics(self) -> tuple[str, str]:
+        """One consumer group for both job topics (spec §03)."""
+        return (self.build_topic, self.substitution_topic)
+
+    def dlq_for(self, topic: str) -> str:
+        """The DLQ of a consumed topic (one DLQ per topic); KeyError for any other topic."""
+        return {
+            self.build_topic: self.build_dlq_topic,
+            self.substitution_topic: self.substitution_dlq_topic,
+        }[topic]
+
     def validate(self) -> None:
         problems = [
             *self._naming_problems(),
@@ -83,6 +99,8 @@ class WorkerConfig:
             "SOLVER_BUILD_TOPIC": self.build_topic,
             "SOLVER_STATUS_TOPIC": self.status_topic,
             "SOLVER_BUILD_DLQ_TOPIC": self.build_dlq_topic,
+            "SOLVER_SUBSTITUTION_TOPIC": self.substitution_topic,
+            "SOLVER_SUBSTITUTION_DLQ_TOPIC": self.substitution_dlq_topic,
         }
         problems.extend(f"{name} must not be empty" for name, v in names.items() if not v.strip())
         topics = {name: v for name, v in names.items() if name != "SOLVER_GROUP_ID"}
@@ -94,7 +112,7 @@ class WorkerConfig:
         seen: dict[str, str] = {}
         for name, value in topics.items():
             if value in seen:
-                # A DLQ equal to the build topic would feed every poison message back forever.
+                # A DLQ equal to a consumed topic would feed every poison message back forever.
                 problems.append(f"{name} must differ from {seen[value]}")
             else:
                 seen[value] = name
@@ -185,6 +203,10 @@ class WorkerConfig:
             build_topic=text("SOLVER_BUILD_TOPIC", defaults.build_topic),
             status_topic=text("SOLVER_STATUS_TOPIC", defaults.status_topic),
             build_dlq_topic=text("SOLVER_BUILD_DLQ_TOPIC", defaults.build_dlq_topic),
+            substitution_topic=text("SOLVER_SUBSTITUTION_TOPIC", defaults.substitution_topic),
+            substitution_dlq_topic=text(
+                "SOLVER_SUBSTITUTION_DLQ_TOPIC", defaults.substitution_dlq_topic
+            ),
             min_time_limit_s=integer("SOLVER_MIN_TIME_LIMIT_S", defaults.min_time_limit_s),
             max_time_limit_s=integer("SOLVER_MAX_TIME_LIMIT_S", defaults.max_time_limit_s),
             num_workers=integer("SOLVER_NUM_WORKERS", defaults.num_workers),

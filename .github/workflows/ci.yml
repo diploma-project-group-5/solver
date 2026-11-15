@@ -71,7 +71,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7, resolved 2026-11-08
         with:
           repository: diploma-project-group-5/contracts
-          ref: 6873552967f684b12955dc752435efc3ed180c52  # tag v0.3.0 (validator-lib uses the same)
+          ref: 32ce02c5ddd8ecc61caba8f3c2a5bcc0a0f30bd8  # tag v0.4.0
           path: _contracts
           persist-credentials: false
 

@@ -3,6 +3,9 @@
 CP-SAT solver for «Лад»: builds the main timetable (capacity model 1.1), the alert timetable (model 1.2)
 and substitution proposals. Runs as a Kafka worker (`solve.build.requested`, `solve.substitution.requested`
 → `solve.status`) and ships the `bench` evaluation CLI.
+Until the stage 2 substitution engine, every `solve.substitution.requested` job is answered at once with
+`solve.completed` MODEL_INVALID / `error.code=unsupported_job_type` (no `solve.started`; a broken message goes to
+`solve.substitution.requested.dlq`) — ADR 2026-11-15.
 
 ## Layout
 
