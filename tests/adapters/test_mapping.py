@@ -1,5 +1,6 @@
 """Payload <-> engine mapping, config validation and server-side clamping."""
 
+import datetime as dt
 import json
 from collections.abc import Callable
 from typing import Any
@@ -33,7 +34,7 @@ from lad_solver.adapters.kafka.mapping import (
     Poison,
     Provenance,
     Rejected,
-    Unsupported,
+    SubstitutionAccepted,
     address_of,
     completed_data,
     completed_message,
@@ -43,6 +44,8 @@ from lad_solver.adapters.kafka.mapping import (
     parse_build_request,
     parse_substitution_request,
     rejected_data,
+    substitution_data,
+    substitution_params,
 )
 from lad_solver.domain.problem import (
     AlertLimits,
@@ -51,6 +54,18 @@ from lad_solver.domain.problem import (
     SchoolClass,
     Teacher,
     TimetableKind,
+)
+from lad_solver.domain.result import SolveStatus, StopReason
+from lad_solver.domain.substitution import (
+    Absence,
+    Hour,
+    Overlay,
+    OverlayKind,
+    Proposal,
+    ProposalKind,
+    Slot,
+    SubstitutionResult,
+    SubstitutionStats,
 )
 
 ADDRESS = Address(UUID(JOB_ID), UUID(SCHOOL_ID), "req-5f2c9a")
@@ -511,29 +526,266 @@ def test_non_finite_numbers_are_redacted_in_the_dlq(literal: bytes) -> None:
     assert loaded["projected"]["data"]["teachers"][1]["unavailable_days"] == "<redacted:list>"
 
 
-# ---------------------------------------------------------------- substitutions (stage 1)
-# Until the stage 2 engine the solver reads only the envelope and data.job_id of a substitution
-# job and answers it with MODEL_INVALID / unsupported_job_type (ADR 2026-11-15).
+# ---------------------------------------------------------------- substitutions (stage 2)
+# contracts 0.5.0: the whole payload is validated, ids and dates resolve, and the baseline week
+# builds before solve.started is promised (ADR 2026-11-15-solver-substitution-engine).
+
+WEDNESDAY = dt.date(2026, 11, 11)
 
 
-def test_substitution_request_is_unsupported_until_stage2_engine() -> None:
-    assert parse_substitution_request(encode(substitution_request())) == Unsupported(ADDRESS)
+def _substitution(**data: object) -> SubstitutionAccepted | Rejected:
+    outcome = parse_substitution_request(encode(substitution_request(**data)))
+    assert not isinstance(outcome, Poison)
+    return outcome
 
 
-def test_substitution_without_job_id_is_poison_until_stage2_engine() -> None:
+def _accepted_substitution(**data: object) -> SubstitutionAccepted:
+    outcome = _substitution(**data)
+    assert isinstance(outcome, SubstitutionAccepted), outcome
+    return outcome
+
+
+def test_substitution_request_maps_to_the_engine_request() -> None:
+    outcome = _accepted_substitution()
+
+    request = outcome.request
+    assert outcome.address == ADDRESS
+    assert (request.date, request.absent_teacher_id) == (WEDNESDAY, "t-1")
+    assert request.lessons == (Slot(WEDNESDAY, "c-5a", 2),)
+    assert request.week[0] == dt.date(2026, 11, 9)
+    assert len(request.week) == 7
+    assert request.not_before == dt.date(2026, 11, 10)
+    assert request.absence_dates == {WEDNESDAY, dt.date(2026, 11, 12)}
+    assert (len(request.template_lessons), len(request.template_formats)) == (20, 10)
+    assert (request.approved, request.absences, request.non_school_dates) == ((), None, None)
+    assert not request.step3
+    assert not request.allow_support_moves
+    assert request.school.kind is TimetableKind.MAIN
+    assert request.school.capacity == Passport(60)
+    assert outcome.queue_deadline_at == dt.datetime(2026, 11, 4, 10, 10, tzinfo=dt.UTC)
+
+
+def test_optional_substitution_fields_map_to_the_domain() -> None:
+    approved = [
+        {"date": "2026-11-09", "class_id": "c-9b", "lesson_no": 1, "teacher_id": "t-2"},
+        {
+            "date": "2026-11-10",
+            "class_id": "c-5a",
+            "lesson_no": 2,
+            "kind": "moved",
+            "moved_to": {"date": "2026-11-13", "lesson_no": 4},
+        },
+        {"date": "2026-11-12", "class_id": "c-9b", "lesson_no": 3, "kind": "self_study"},
+        {"date": "2026-11-13", "class_id": "c-9b", "lesson_no": 3, "kind": "cancelled"},
+    ]
+    absences = [
+        {"teacher_id": "t-1", "date": "2026-11-09", "lesson_nos": [1]},
+        {"teacher_id": "t-1", "date": "2026-11-10", "lesson_nos": [2]},
+        {"teacher_id": "t-1", "date": "2026-11-11", "lesson_nos": None},
+        {"teacher_id": "t-2", "date": "2026-11-12", "lesson_nos": [3]},
+        {"teacher_id": "t-2", "date": "2026-11-13", "lesson_nos": [3]},
+    ]
+
+    request = _accepted_substitution(
+        approved_substitutions=approved,
+        absences=absences,
+        non_school_dates=[],
+        allow_support_moves=True,
+    ).request
+
+    assert [o.kind for o in request.approved] == list(OverlayKind)
+    assert request.approved[0] == Overlay(
+        Slot(dt.date(2026, 11, 9), "c-9b", 1), OverlayKind.TEACHER, "t-2"
+    )
+    assert request.approved[1].moved_to == Hour(dt.date(2026, 11, 13), 4)
+    assert request.absences is not None
+    assert request.absences[2] == Absence("t-1", WEDNESDAY, None)
+    assert request.absences[0].lesson_nos == {1}
+    assert (request.non_school_dates, request.step3) == (frozenset(), True)
+    assert request.allow_support_moves
+
+
+def test_substitution_input_sha256_ignores_the_job_but_not_the_problem() -> None:
+    base = _accepted_substitution().input_sha256
+    other_job = _accepted_substitution(
+        job_id="11111111-2222-4333-8444-555555555555",
+        time_limit_s=60,
+        queue_deadline_at="2026-11-05T00:00:00Z",
+    ).input_sha256
+    other_window = _accepted_substitution(not_before="2026-11-11").input_sha256
+
+    assert base == other_job
+    assert base != other_window
+
+
+SCHEMA_VIOLATIONS: list[tuple[str, object]] = [
+    ("lessons", []),
+    ("absence_dates", []),
+    ("absence_dates", ["2026-11-11", "2026-11-11"]),
+    ("date", "2026-11-11T00:00:00"),
+    ("date", "2026-02-30"),
+    ("date", 1762819200),
+    ("not_before", "11.11.2026"),
+    ("iso_week", "2026-47"),
+    ("iso_week", "2026-W54"),
+    ("absences", None),
+    ("non_school_dates", None),
+    ("non_school_dates", ["2026-11-13", "2026-11-13"]),
+    ("approved_substitutions", [{"date": "2026-11-09", "class_id": "c-9b", "lesson_no": 1}]),
+    (
+        "approved_substitutions",
+        [{"date": "2026-11-09", "class_id": "c-9b", "lesson_no": 1, "kind": "moved"}],
+    ),
+    (
+        "approved_substitutions",
+        [
+            {
+                "date": "2026-11-09",
+                "class_id": "c-9b",
+                "lesson_no": 1,
+                "kind": "self_study",
+                "teacher_id": "t-2",
+            }
+        ],
+    ),
+    ("absences", [{"teacher_id": "t-1", "date": "2026-11-11", "lesson_nos": []}]),
+    ("absences", [{"teacher_id": "t-1", "date": "2026-11-11"}]),
+    ("template", {"timetable_id": "x", "kind": "main", "lessons": [], "day_formats": []}),
+    ("capacity", {"seats": 10}),
+]
+
+
+@pytest.mark.parametrize(("field", "value"), SCHEMA_VIOLATIONS)
+def test_substitution_schema_violations_are_rejected(field: str, value: object) -> None:
+    outcome = _substitution(**{field: value})
+
+    assert outcome == Rejected(ADDRESS, ErrorCode.INVALID_PAYLOAD, "validation")
+
+
+def _template_with(lesson: Json) -> Json:
+    template = substitution_request()["data"]["template"]
+    template["lessons"].append(lesson)
+    return template
+
+
+REFERENTIAL: dict[str, dict[str, object]] = {
+    "absent-teacher-unknown": {"absent_teacher_id": "t-9"},
+    "date-outside-the-week": {"date": "2026-11-18", "absence_dates": ["2026-11-18"]},
+    "date-not-a-school-day": {"date": "2026-11-14", "absence_dates": ["2026-11-14"]},
+    "date-is-a-non-school-date": {"non_school_dates": ["2026-11-11"]},
+    "date-not-an-absence-date": {"absence_dates": ["2026-11-12"]},
+    "non-school-date-outside-the-week": {"non_school_dates": ["2026-11-20"]},
+    "week-the-year-does-not-have": {"iso_week": "2025-W53"},
+    "lesson-of-an-unknown-class": {"lessons": [{"class_id": "c-1x", "lesson_no": 2}]},
+    "template-lesson-of-an-unknown-teacher": {
+        "template": _template_with(
+            {"class_id": "c-9b", "day": 1, "lesson_no": 6, "subject_id": "s-pe", "teacher_id": "x"}
+        )
+    },
+    "approved-outside-the-week": {
+        "approved_substitutions": [
+            {"date": "2026-11-16", "class_id": "c-9b", "lesson_no": 1, "teacher_id": "t-2"}
+        ]
+    },
+    "approved-unknown-substitute": {
+        "approved_substitutions": [
+            {"date": "2026-11-09", "class_id": "c-9b", "lesson_no": 1, "teacher_id": "t-9"}
+        ]
+    },
+    "moved-outside-the-week": {
+        "approved_substitutions": [
+            {
+                "date": "2026-11-09",
+                "class_id": "c-9b",
+                "lesson_no": 1,
+                "kind": "moved",
+                "moved_to": {"date": "2026-11-16", "lesson_no": 4},
+            }
+        ]
+    },
+    "absence-of-an-unknown-teacher": {
+        "absences": [{"teacher_id": "t-9", "date": "2026-11-11", "lesson_nos": None}]
+    },
+    "absence-outside-the-week": {
+        "absences": [{"teacher_id": "t-1", "date": "2026-11-18", "lesson_nos": None}]
+    },
+    "alert-template-without-seats": {
+        "template": substitution_request()["data"]["template"] | {"kind": "alert"}
+    },
+    # the week itself (domain): it must be one consistent week
+    "approved-on-an-empty-slot": {
+        "approved_substitutions": [
+            {"date": "2026-11-09", "class_id": "c-9b", "lesson_no": 2, "kind": "self_study"}
+        ]
+    },
+    "approved-twice-on-a-slot": {
+        "approved_substitutions": [
+            {"date": "2026-11-09", "class_id": "c-9b", "lesson_no": 1, "teacher_id": "t-2"},
+            {"date": "2026-11-09", "class_id": "c-9b", "lesson_no": 1, "kind": "cancelled"},
+        ]
+    },
+    "moved-into-an-occupied-slot": {
+        "approved_substitutions": [
+            {
+                "date": "2026-11-09",
+                "class_id": "c-9b",
+                "lesson_no": 1,
+                "kind": "moved",
+                "moved_to": {"date": "2026-11-10", "lesson_no": 3},
+            }
+        ]
+    },
+    "lesson-to-cover-is-not-the-absent-teachers": {
+        "lessons": [{"class_id": "c-5a", "lesson_no": 1}]
+    },
+    "lesson-to-cover-is-not-a-lesson": {"lessons": [{"class_id": "c-9b", "lesson_no": 2}]},
+    "lesson-to-cover-twice": {
+        "lessons": [{"class_id": "c-5a", "lesson_no": 2}, {"class_id": "c-5a", "lesson_no": 2}]
+    },
+    "lesson-to-cover-already-substituted": {
+        "approved_substitutions": [
+            {"date": "2026-11-11", "class_id": "c-5a", "lesson_no": 2, "teacher_id": "t-2"}
+        ]
+    },
+    "two-lessons-in-one-class-slot": {
+        "template": _template_with(
+            {
+                "class_id": "c-5a",
+                "day": 1,
+                "lesson_no": 1,
+                "subject_id": "s-pe",
+                "teacher_id": "t-2",
+            }
+        )
+    },
+    "two-absences-of-a-teacher-on-a-date": {
+        "absences": [
+            {"teacher_id": "t-1", "date": "2026-11-11", "lesson_nos": None},
+            {"teacher_id": "t-1", "date": "2026-11-11", "lesson_nos": [2]},
+        ]
+    },
+}
+
+
+@pytest.mark.parametrize("case", sorted(REFERENTIAL))
+def test_inconsistent_substitution_requests_are_referential_integrity(case: str) -> None:
+    outcome = _substitution(**REFERENTIAL[case])
+
+    assert outcome == Rejected(ADDRESS, ErrorCode.INVALID_PAYLOAD, "referential_integrity")
+
+
+def test_substitution_without_job_id_is_poison() -> None:
     document = with_data(substitution_request(), lambda d: d.pop("job_id"))
 
     assert parse_substitution_request(encode(document)) == Poison("invalid_envelope")
 
 
 @pytest.mark.parametrize(("raw", "error_class"), [(b"{", "not_json"), (b"[]", "not_json_object")])
-def test_unparseable_substitution_is_poison_until_stage2_engine(
-    raw: bytes, error_class: str
-) -> None:
+def test_unparseable_substitution_is_poison(raw: bytes, error_class: str) -> None:
     assert parse_substitution_request(raw) == Poison(error_class)
 
 
-def test_foreign_type_on_the_substitution_topic_is_rejected_until_stage2_engine() -> None:
+def test_foreign_type_on_the_substitution_topic_is_rejected() -> None:
     document = substitution_request()
     document["type"] = "solve.build.requested"
 
@@ -549,9 +801,7 @@ def test_substitution_type_on_the_build_topic_is_still_rejected() -> None:
 
 
 @pytest.mark.parametrize("version", ["2", "2.0", "0.9"])
-def test_substitution_with_other_major_is_unsupported_schema_until_stage2_engine(
-    version: str,
-) -> None:
+def test_substitution_with_other_major_is_unsupported_schema(version: str) -> None:
     document = substitution_request()
     document["schema_version"] = version
 
@@ -560,8 +810,16 @@ def test_substitution_with_other_major_is_unsupported_schema_until_stage2_engine
     assert outcome == Rejected(ADDRESS, ErrorCode.UNSUPPORTED_SCHEMA_VERSION, "schema_version")
 
 
+@pytest.mark.parametrize("version", ["1", "1.1", "1.0.0"])
+def test_substitution_with_a_newer_minor_is_solved(version: str) -> None:
+    document = substitution_request()
+    document["schema_version"] = version
+
+    assert isinstance(parse_substitution_request(encode(document)), SubstitutionAccepted)
+
+
 @pytest.mark.parametrize("case", sorted(set(ENVELOPE_ERRORS) - {"no-data"}))
-def test_substitution_envelope_errors_are_rejected_until_stage2_engine(case: str) -> None:
+def test_substitution_envelope_errors_are_rejected(case: str) -> None:
     document = substitution_request()
     ENVELOPE_ERRORS[case](document)
 
@@ -575,7 +833,7 @@ def test_substitution_envelope_errors_are_rejected_until_stage2_engine(case: str
 @pytest.mark.parametrize(
     ("field", "value"), [("time", "yesterday"), ("source", 123), ("source", [])]
 )
-def test_substitution_with_a_malformed_time_or_source_is_rejected_until_stage2_engine(
+def test_substitution_with_a_malformed_time_or_source_is_rejected(
     field: str, value: object
 ) -> None:
     document = substitution_request()
@@ -587,13 +845,17 @@ def test_substitution_with_a_malformed_time_or_source_is_rejected_until_stage2_e
 
 
 @pytest.mark.parametrize("field", ["time", "source"])
-def test_substitution_without_time_or_source_is_unsupported_until_stage2_engine(
-    field: str,
-) -> None:
+def test_substitution_without_time_or_source_is_solved(field: str) -> None:
     document = substitution_request()
     document.pop(field)
 
-    assert parse_substitution_request(encode(document)) == Unsupported(ADDRESS)
+    assert isinstance(parse_substitution_request(encode(document)), SubstitutionAccepted)
+
+
+def test_unknown_substitution_fields_are_ignored() -> None:
+    document = with_data(substitution_request(), lambda d: d.update(absent_teacher_name="X"))
+
+    assert isinstance(parse_substitution_request(encode(document)), SubstitutionAccepted)
 
 
 _JSON_SCALARS = (
@@ -611,27 +873,110 @@ _JSON = st.recursive(
 
 
 @given(data=st.dictionaries(st.text(max_size=16), _JSON, max_size=8))
-def test_any_substitution_data_with_a_job_id_is_unsupported_until_stage2_engine(
-    data: Json,
-) -> None:
-    """The draft payload is never parsed: whatever stage 2 adds, the job is still answered."""
+def test_any_substitution_data_with_a_job_id_is_answered_never_crashes(data: Json) -> None:
+    """Garbage with an address is answered (invalid_payload), never dropped or a parser bug."""
     document = substitution_request()
     document["data"] = data | {"job_id": JOB_ID}
 
-    assert parse_substitution_request(encode(document)) == Unsupported(ADDRESS)
+    outcome = parse_substitution_request(encode(document))
+
+    assert outcome == Rejected(ADDRESS, ErrorCode.INVALID_PAYLOAD, "validation")
 
 
-def test_unsupported_job_type_carries_no_conflicts() -> None:
-    data = rejected_data(UUID(JOB_ID), ErrorCode.UNSUPPORTED_JOB_TYPE)
+@pytest.mark.parametrize(("requested", "clamped"), [(1, 10.0), (15, 15.0), (3600, 180.0)])
+def test_substitution_time_limit_is_clamped_server_side(requested: int, clamped: float) -> None:
+    data = _accepted_substitution(time_limit_s=requested).data
 
-    assert data == {
-        "job_id": JOB_ID,
-        "status": "MODEL_INVALID",
-        "lessons": [],
-        "day_formats": [],
-        "conflicts": [],
-        "error": {"code": "unsupported_job_type"},
+    params = substitution_params(data, min_time_limit_s=10, max_time_limit_s=180, seed=3)
+
+    assert (params.time_limit_s, params.random_seed) == (clamped, 3)
+    assert params.deterministic_time == clamped
+
+
+def _result(*proposals: Proposal) -> SubstitutionResult:
+    stats = SubstitutionStats(stop_reason=StopReason.TIME_LIMIT, random_seed=5)
+    return SubstitutionResult(SolveStatus.FEASIBLE, proposals, stats)
+
+
+def test_substitution_result_maps_to_the_contract_rows() -> None:
+    result = _result(
+        Proposal(Slot(WEDNESDAY, "c-5", 3), ProposalKind.TEACHER, 1, "t-12", off_profile=True),
+        Proposal(Slot(WEDNESDAY, "c-6", 2), ProposalKind.MOVED, 2, moved_to=Hour(WEDNESDAY, 6)),
+        Proposal(
+            Slot(WEDNESDAY, "c-7", 4),
+            ProposalKind.MOVED,
+            3,
+            moved_to=Hour(dt.date(2026, 11, 13), 6),
+        ),
+        Proposal(Slot(WEDNESDAY, "c-2", 5), ProposalKind.SELF_STUDY, 3),
+    )
+
+    data = substitution_data(
+        UUID(JOB_ID), result, Provenance(wall_time_ms=7, input_sha256="a" * 64)
+    )
+
+    assert json.dumps(data["substitution"]) == json.dumps(
+        {
+            "step": 3,
+            "proposals": [
+                {
+                    "date": "2026-11-11",
+                    "class_id": "c-5",
+                    "lesson_no": 3,
+                    "kind": "teacher",
+                    "teacher_id": "t-12",
+                    "off_profile": True,
+                    "step": 1,
+                },
+                {
+                    "date": "2026-11-11",
+                    "class_id": "c-6",
+                    "lesson_no": 2,
+                    "kind": "moved",
+                    "moved_to": {"date": "2026-11-11", "lesson_no": 6},
+                    "step": 2,
+                },
+                {
+                    "date": "2026-11-11",
+                    "class_id": "c-7",
+                    "lesson_no": 4,
+                    "kind": "moved",
+                    "moved_to": {"date": "2026-11-13", "lesson_no": 6},
+                    "step": 3,
+                },
+                {
+                    "date": "2026-11-11",
+                    "class_id": "c-2",
+                    "lesson_no": 5,
+                    "kind": "self_study",
+                    "step": 3,
+                },
+            ],
+        }
+    )
+    assert (data["status"], data["lessons"], data["day_formats"], data["conflicts"]) == (
+        "FEASIBLE",
+        [],
+        [],
+        [],
+    )
+    assert data["stats"] == {
+        "wall_time_ms": 7,
+        "num_workers": 1,
+        "random_seed": 5,
+        "solver_version": data["stats"]["solver_version"],  # type: ignore[index]
+        "model_version": "a+a2+b+s/2026-11-15",
+        "input_sha256": "a" * 64,
+        "stop_reason": "time_limit",
     }
+
+
+def test_more_proposals_than_the_schema_allows_are_result_too_large() -> None:
+    rows = [Proposal(Slot(WEDNESDAY, f"c-{i}", 1), ProposalKind.SELF_STUDY, 2) for i in range(601)]
+
+    data = substitution_data(UUID(JOB_ID), _result(*rows), None)
+
+    assert data == rejected_data(UUID(JOB_ID), ErrorCode.RESULT_TOO_LARGE)
 
 
 @pytest.mark.parametrize(
@@ -641,7 +986,6 @@ def test_unsupported_job_type_carries_no_conflicts() -> None:
         (ErrorCode.UNSUPPORTED_SCHEMA_VERSION, [{"rule": "invalid_input"}]),
         (ErrorCode.RESULT_TOO_LARGE, []),
         (ErrorCode.INTERNAL, []),
-        (ErrorCode.UNSUPPORTED_JOB_TYPE, []),
     ],
 )
 def test_only_input_errors_name_the_invalid_input_rule(

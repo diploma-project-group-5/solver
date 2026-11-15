@@ -67,6 +67,14 @@ ALLOWED_FIELDS: Final = frozenset(
         "zero_day_before",
         "zero_day_after",
         "phase_b_retry_days",
+        # job kind and the substitution summary (ADR 2026-11-15-solver-substitution-engine):
+        # counts and enum values, never who is absent or which lessons
+        "job_kind",
+        "step",
+        "proposals",
+        "self_study",
+        "covered",
+        "cp_runs",
     }
 )
 

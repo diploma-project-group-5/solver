@@ -5,12 +5,25 @@ import signal
 
 import pytest
 from confluent_kafka import KafkaException
-from kafka_support import build_request, encode, harness
+from kafka_support import build_request, encode, harness, substitution_request
 
 from lad_solver.adapters.kafka import main as worker_main
-from lad_solver.adapters.kafka.mapping import Accepted, parse_build_request
+from lad_solver.adapters.kafka.mapping import (
+    Accepted,
+    SubstitutionAccepted,
+    parse_build_request,
+    parse_substitution_request,
+)
 from lad_solver.domain.problem import Params, Problem
 from lad_solver.domain.result import Result, SolveStatus
+from lad_solver.domain.substitution import (
+    Proposal,
+    ProposalKind,
+    SubstitutionParams,
+    SubstitutionRequest,
+    SubstitutionResult,
+    SubstitutionStats,
+)
 from lad_solver.model.progress import Progress
 from lad_solver.model.stop import StopHandle
 
@@ -105,6 +118,33 @@ def test_production_engine_passes_stop_and_progress_to_solve(
 
     assert result.status is SolveStatus.UNKNOWN
     assert calls == [(outcome.problem, params, stop, progress)]
+
+
+def test_production_substitution_engine_passes_the_stop_to_substitute(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[SubstitutionRequest, SubstitutionParams, StopHandle | None]] = []
+    outcome = parse_substitution_request(encode(substitution_request()))
+    assert isinstance(outcome, SubstitutionAccepted)
+    [slot] = outcome.request.lessons
+    self_study = Proposal(slot, ProposalKind.SELF_STUDY, 2)
+    answer = SubstitutionResult(SolveStatus.FEASIBLE, (self_study,), SubstitutionStats())
+
+    def fake_substitute(
+        request: SubstitutionRequest,
+        params: SubstitutionParams,
+        stop: StopHandle | None = None,
+    ) -> SubstitutionResult:
+        calls.append((request, params, stop))
+        return answer
+
+    monkeypatch.setattr(worker_main, "substitute", fake_substitute)
+    params, stop = SubstitutionParams(time_limit_s=10.0), StopHandle()
+
+    result = worker_main._substitution_engine(outcome.request, params, stop)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+    assert result is answer
+    assert calls == [(outcome.request, params, stop)]
 
 
 class _IdleWorker:

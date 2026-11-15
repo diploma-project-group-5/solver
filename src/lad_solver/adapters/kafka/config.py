@@ -9,7 +9,7 @@ from pathlib import Path
 # Topics are created by platform/kafka-init (auto.create.topics.enable=false).
 DEFAULT_BUILD_TOPIC = "solve.build.requested"
 DEFAULT_STATUS_TOPIC = "solve.status"
-# Consumed by the same group; until the stage 2 engine every job is refused (ADR 2026-11-15).
+# Consumed by the same group as builds; solved by the stage 2 engine (solver >= 0.4.0).
 DEFAULT_SUBSTITUTION_TOPIC = "solve.substitution.requested"
 
 
