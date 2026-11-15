@@ -581,7 +581,8 @@ def test_optional_substitution_fields_map_to_the_domain() -> None:
     absences = [
         {"teacher_id": "t-1", "date": "2026-11-09", "lesson_nos": [1]},
         {"teacher_id": "t-1", "date": "2026-11-10", "lesson_nos": [2]},
-        {"teacher_id": "t-1", "date": "2026-11-11", "lesson_nos": None},
+        {"teacher_id": "t-1", "date": "2026-11-11", "lesson_nos": [2]},
+        {"teacher_id": "t-1", "date": "2026-11-12", "lesson_nos": None},
         {"teacher_id": "t-2", "date": "2026-11-12", "lesson_nos": [3]},
         {"teacher_id": "t-2", "date": "2026-11-13", "lesson_nos": [3]},
     ]
@@ -599,7 +600,8 @@ def test_optional_substitution_fields_map_to_the_domain() -> None:
     )
     assert request.approved[1].moved_to == Hour(dt.date(2026, 11, 13), 4)
     assert request.absences is not None
-    assert request.absences[2] == Absence("t-1", WEDNESDAY, None)
+    assert request.absences[2] == Absence("t-1", WEDNESDAY, frozenset({2}))
+    assert request.absences[3] == Absence("t-1", dt.date(2026, 11, 12), None)
     assert request.absences[0].lesson_nos == {1}
     assert (request.non_school_dates, request.step3) == (frozenset(), True)
     assert request.allow_support_moves
@@ -677,19 +679,9 @@ REFERENTIAL: dict[str, dict[str, object]] = {
     "non-school-date-outside-the-week": {"non_school_dates": ["2026-11-20"]},
     "week-the-year-does-not-have": {"iso_week": "2025-W53"},
     "lesson-of-an-unknown-class": {"lessons": [{"class_id": "c-1x", "lesson_no": 2}]},
-    "template-lesson-of-an-unknown-teacher": {
-        "template": _template_with(
-            {"class_id": "c-9b", "day": 1, "lesson_no": 6, "subject_id": "s-pe", "teacher_id": "x"}
-        )
-    },
     "approved-outside-the-week": {
         "approved_substitutions": [
             {"date": "2026-11-16", "class_id": "c-9b", "lesson_no": 1, "teacher_id": "t-2"}
-        ]
-    },
-    "approved-unknown-substitute": {
-        "approved_substitutions": [
-            {"date": "2026-11-09", "class_id": "c-9b", "lesson_no": 1, "teacher_id": "t-9"}
         ]
     },
     "moved-outside-the-week": {
@@ -742,10 +734,48 @@ REFERENTIAL: dict[str, dict[str, object]] = {
     "lesson-to-cover-twice": {
         "lessons": [{"class_id": "c-5a", "lesson_no": 2}, {"class_id": "c-5a", "lesson_no": 2}]
     },
+    # t-1 took t-2's PE in c-9b L3 as an approved substitute, then fell ill himself: that slot
+    # already has its one approved overlay, so it cannot get a second (open question, timetable)
     "lesson-to-cover-already-substituted": {
         "approved_substitutions": [
-            {"date": "2026-11-11", "class_id": "c-5a", "lesson_no": 2, "teacher_id": "t-2"}
-        ]
+            {"date": "2026-11-11", "class_id": "c-9b", "lesson_no": 3, "teacher_id": "t-1"}
+        ],
+        "lessons": [{"class_id": "c-5a", "lesson_no": 2}, {"class_id": "c-9b", "lesson_no": 3}],
+    },
+    "duplicate-day-format": {
+        "template": substitution_request()["data"]["template"]
+        | {
+            "day_formats": [
+                *substitution_request()["data"]["template"]["day_formats"],
+                {"class_id": "c-5a", "day": 3, "in_person": False},
+            ]
+        }
+    },
+    "lesson-to-cover-without-day-format": {
+        "template": substitution_request()["data"]["template"]
+        | {
+            "day_formats": [
+                f
+                for f in substitution_request()["data"]["template"]["day_formats"]
+                if (f["class_id"], f["day"]) != ("c-5a", 3)
+            ]
+        }
+    },
+    # absent all Wednesday, but c-9b L1 (his maths) is not among the lessons to cover
+    "absent-hour-lesson-not-listed": {
+        "absences": [{"teacher_id": "t-1", "date": "2026-11-11", "lesson_nos": None}]
+    },
+    "lesson-to-cover-of-an-archived-class": {
+        "template": _template_with(
+            {
+                "class_id": "c-0x",
+                "day": 3,
+                "lesson_no": 6,
+                "subject_id": "s-pe",
+                "teacher_id": "t-1",
+            }
+        ),
+        "lessons": [{"class_id": "c-5a", "lesson_no": 2}, {"class_id": "c-0x", "lesson_no": 6}],
     },
     "two-lessons-in-one-class-slot": {
         "template": _template_with(
@@ -760,7 +790,8 @@ REFERENTIAL: dict[str, dict[str, object]] = {
     },
     "two-absences-of-a-teacher-on-a-date": {
         "absences": [
-            {"teacher_id": "t-1", "date": "2026-11-11", "lesson_nos": None},
+            {"teacher_id": "t-1", "date": "2026-11-11", "lesson_nos": [2]},
+            {"teacher_id": "t-1", "date": "2026-11-12", "lesson_nos": None},
             {"teacher_id": "t-1", "date": "2026-11-11", "lesson_nos": [2]},
         ]
     },
@@ -772,6 +803,87 @@ def test_inconsistent_substitution_requests_are_referential_integrity(case: str)
     outcome = _substitution(**REFERENTIAL[case])
 
     assert outcome == Rejected(ADDRESS, ErrorCode.INVALID_PAYLOAD, "referential_integrity")
+    assert isinstance(outcome, Rejected)
+    assert outcome.reason  # the rule, for the logs: a fixed literal, never an input value
+    assert all(not c.isdigit() for c in outcome.reason)
+
+
+@pytest.mark.parametrize(
+    ("case", "reason"),
+    [
+        (
+            "lesson-to-cover-already-substituted",
+            "a lesson to cover already has an approved substitution",
+        ),
+        (
+            "absent-hour-lesson-not-listed",
+            "a lesson of the absent teacher in an absent hour is not listed",
+        ),
+        ("lesson-to-cover-without-day-format", "a lesson to cover has no day format"),
+        ("duplicate-day-format", "two day formats for one class and day"),
+        (
+            "lesson-to-cover-of-an-archived-class",
+            "a lesson to cover of a class outside the snapshot",
+        ),
+        ("approved-on-an-empty-slot", "an overlay on a slot without a lesson"),
+    ],
+)
+def test_a_rejection_names_the_rule_the_request_broke(case: str, reason: str) -> None:
+    outcome = _substitution(**REFERENTIAL[case])
+
+    assert isinstance(outcome, Rejected)
+    assert outcome.reason == reason
+
+
+def test_a_schema_violation_names_the_field_never_the_value() -> None:
+    outcome = _substitution(absent_teacher_id="Іваненко")  # a name typed into an id
+
+    assert isinstance(outcome, Rejected)
+    assert outcome.reason == "string_pattern_mismatch at data.absent_teacher_id"
+
+
+def test_ids_that_left_the_snapshot_are_accepted_in_the_template_and_overlays() -> None:
+    """timetable projects active ids only while the published template keeps the old ones
+    (spec: archived classes and subjects, deleted teachers): validator-lib reports such lessons
+    as conflicts the week already has, so the job is still answered."""
+    template = substitution_request()["data"]["template"]
+    template = template | {
+        "lessons": [
+            *template["lessons"],
+            {
+                "class_id": "c-0x",
+                "day": 1,
+                "lesson_no": 6,
+                "subject_id": "s-old",
+                "teacher_id": "t-9",
+            },
+            {
+                "class_id": "c-9b",
+                "day": 2,
+                "lesson_no": 5,
+                "subject_id": "s-pe",
+                "teacher_id": "t-9",
+            },
+        ],
+        "day_formats": [
+            *template["day_formats"],
+            {"class_id": "c-0x", "day": 1, "in_person": True},
+        ],
+    }
+    approved = [{"date": "2026-11-09", "class_id": "c-9b", "lesson_no": 3, "teacher_id": "t-9"}]
+
+    outcome = _substitution(template=template, approved_substitutions=approved)
+
+    assert isinstance(outcome, SubstitutionAccepted)
+
+
+def test_unknown_data_fields_are_counted() -> None:
+    document = with_data(substitution_request(), lambda d: d.update(absence=[], non_school_date=[]))
+
+    outcome = parse_substitution_request(encode(document))
+
+    assert isinstance(outcome, SubstitutionAccepted)
+    assert outcome.ignored_fields == 2  # a misspelt key turns a feature off: the worker warns
 
 
 def test_substitution_without_job_id_is_poison() -> None:
@@ -887,9 +999,9 @@ def test_any_substitution_data_with_a_job_id_is_answered_never_crashes(data: Jso
 def test_substitution_time_limit_is_clamped_server_side(requested: int, clamped: float) -> None:
     data = _accepted_substitution(time_limit_s=requested).data
 
-    params = substitution_params(data, min_time_limit_s=10, max_time_limit_s=180, seed=3)
+    params = substitution_params(data, min_time_limit_s=10, max_time_limit_s=180)
 
-    assert (params.time_limit_s, params.random_seed) == (clamped, 3)
+    assert (params.time_limit_s, params.random_seed) == (clamped, 0)  # the ADR fixes seed 0
     assert params.deterministic_time == clamped
 
 

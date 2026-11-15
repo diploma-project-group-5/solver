@@ -96,7 +96,8 @@ def _substitution_with_personal_data(document: Json) -> Json:
         data["lessons"][0]["teacher_signature"] = MARKER
         data["teachers"][0]["signature"] = MARKER
         data["absences"] = [
-            {"teacher_id": "t-1", "date": "2026-11-11", "lesson_nos": None, "reason": MARKER}
+            {"teacher_id": "t-1", "date": "2026-11-11", "lesson_nos": [2], "reason": MARKER},
+            {"teacher_id": "t-1", "date": "2026-11-12", "lesson_nos": None, "reason": MARKER},
         ]
 
     changed = with_data(document, add)

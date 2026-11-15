@@ -34,6 +34,8 @@ from lad_solver.adapters.kafka.mapping import (
     substitution_params,
 )
 from lad_solver.app.substitute import substitute
+from lad_solver.domain.result import StopReason
+from lad_solver.domain.substitution import SubstitutionResult
 
 pytestmark = SKIP_WITHOUT_CONTRACTS
 
@@ -70,7 +72,7 @@ def answer(request: Json) -> Json:
     """``data`` of solve.completed for a request, through the production mapping."""
     outcome = parse_substitution_request(encode(_envelope(request)))
     assert isinstance(outcome, SubstitutionAccepted), outcome
-    params = substitution_params(outcome.data, min_time_limit_s=10, max_time_limit_s=180, seed=0)
+    params = substitution_params(outcome.data, min_time_limit_s=10, max_time_limit_s=180)
     result = substitute(outcome.request, params)
     provenance = Provenance(wall_time_ms=0, input_sha256=outcome.input_sha256)  # no clock here
     return substitution_data(UUID(request["job_id"]), result, provenance)
@@ -96,6 +98,26 @@ _NAMES = [p.stem for p in SOLVE_VECTORS]
 def test_all_engine_vectors_are_here() -> None:
     assert len(_NAMES) >= 23
     assert {_vector(n)["name"] for n in _NAMES} == set(_NAMES)
+    # the golden builder's own checks must not pass on an empty or renamed folder
+    assert (len(WEEK_VECTORS), len(APPROVE_VECTORS)) >= (30, 7)
+
+
+@cache
+def _engine(name: str) -> SubstitutionResult:
+    request = _vector(name)["given"]["request"]
+    outcome = parse_substitution_request(encode(_envelope(request)))
+    assert isinstance(outcome, SubstitutionAccepted), outcome
+    params = substitution_params(outcome.data, min_time_limit_s=10, max_time_limit_s=180)
+    return substitute(outcome.request, params)
+
+
+@pytest.mark.parametrize("name", _NAMES)
+def test_engine_runs_each_vector_to_the_end_without_an_anomaly(name: str) -> None:
+    """A step model that fails (an engine bug) would only show as more self-study."""
+    stats = _engine(name).stats
+
+    assert (stats.stop_reason, stats.anomalies) == (StopReason.COMPLETED, ())
+    assert (stats.absences_completed, stats.overlays_ignored) == (0, 0)  # consistent requests
 
 
 @pytest.mark.parametrize("name", _NAMES)
@@ -284,3 +306,75 @@ def test_new_conflicts_mode_answers_the_contract_approve_pairs() -> None:
     outcomes = substitution_golden.new_conflicts(pairs)
 
     assert {k: substitution_golden.added(o) for k, o in outcomes.items()} == expected
+
+
+def test_golden_check_reports_what_bad_proposals_add() -> None:
+    """The harness itself: proposals that break a rule must show up in ``added`` (a harness that
+    dropped the proposals would pass every engine answer vacuously)."""
+    request = _vector("01-step1-free-teacher")["given"]["request"]
+    date = request["date"]
+    bad = {
+        # t-2 teaches c-2 in L1 already
+        "teacher_double_booked": {
+            "kind": "teacher",
+            "teacher_id": "t-2",
+            "off_profile": True,
+            "step": 1,
+        },
+        # c-1 has its Ukrainian lesson in L2
+        "class_double_booked": {
+            "kind": "moved",
+            "moved_to": {"date": date, "lesson_no": 2},
+            "step": 2,
+        },
+        # t-1 is absent all day
+        "teacher_unavailable_day": {
+            "kind": "moved",
+            "moved_to": {"date": date, "lesson_no": 5},
+            "step": 2,
+        },
+    }
+    cases = {
+        rule: substitution_golden.weeks(
+            request, [{"date": date, "class_id": "c-1", "lesson_no": 1} | row]
+        )
+        for rule, row in bad.items()
+    }
+    control = [{"date": date, "class_id": "c-1", "lesson_no": 1, "kind": "self_study", "step": 2}]
+    cases["control"] = substitution_golden.weeks(request, control)
+
+    outcomes = substitution_golden.new_conflicts(cases)
+
+    for rule in bad:
+        assert rule in {c["rule"] for c in substitution_golden.added(outcomes[rule])}, rule
+    assert substitution_golden.added(outcomes["control"]) == []
+
+
+def test_golden_weeks_follow_the_request() -> None:
+    """How a request becomes the two weeks: dates to weekdays, a whole-day absence lists every
+    lesson, a non-school school day is a holiday, a missing absences is the absent teacher all
+    of the absence dates of the week, and an overlay without kind is a teacher overlay."""
+    request = copy.deepcopy(_vector("16-step3-non-school-dates")["given"]["request"])
+    request["approved_substitutions"] = [
+        {"date": "2026-11-16", "class_id": "c-3", "lesson_no": 2, "teacher_id": "t-5"}
+    ]
+    without = {k: v for k, v in request.items() if k != "absences"}
+
+    baseline, effective = substitution_golden.weeks(request, [])
+    implied, _ = substitution_golden.weeks(without, [])
+
+    assert baseline["holidays"] == [3]
+    assert 3 not in baseline["snapshot"]["school_days"]
+    assert baseline["absences"] == [
+        {"teacher_id": "t-1", "day": 2, "lesson_nos": [1, 2, 3, 4, 5, 6]}
+    ]
+    assert implied["absences"] == baseline["absences"]
+    [substitute] = [
+        x for x in baseline["timetable"]["lessons"] if x.get("origin") == "substitution"
+    ]
+    assert (substitute["day"], substitute["class_id"], substitute["teacher_id"]) == (
+        1,
+        "c-3",
+        "t-5",
+    )
+    assert effective == baseline

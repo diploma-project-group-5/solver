@@ -73,7 +73,7 @@ from lad_solver.adapters.kafka.ports import (
 )
 from lad_solver.app.substitute import NUM_WORKERS as SUBSTITUTION_WORKERS
 from lad_solver.domain.problem import Params, Problem
-from lad_solver.domain.result import ConflictRule, Result, SolveStatus
+from lad_solver.domain.result import ConflictRule, Result, SolveStatus, StopReason
 from lad_solver.domain.substitution import ProposalKind, SubstitutionResult
 from lad_solver.model.progress import Progress
 from lad_solver.model.stop import StopHandle
@@ -336,9 +336,21 @@ class Worker:
         address = outcome.address
         completed = self._completed(address, rejected_data(address.job_id, outcome.code))
         self._send_completed(completed, address)
-        self._send_dlq(message, route, outcome.error_class, address)
+        self._send_dlq(message, route, outcome.error_class, address, outcome.reason)
         self._commit(message, address)
-        self._log_completed(address, completed, error_class=outcome.error_class)
+        # The rule the request broke, so producer bugs can be found (a literal or a field path).
+        jsonlog.log(
+            WARNING,
+            "job.rejected",
+            **_ids(address),
+            topic=message.topic,
+            error_code=outcome.code.value,
+            error_class=outcome.error_class,
+            reason=outcome.reason,
+        )
+        self._log_completed(
+            address, completed, error_class=outcome.error_class, reason=outcome.reason
+        )
 
     def _on_expired(
         self, message: InboundMessage, outcome: Accepted | SubstitutionAccepted, now: datetime
@@ -443,7 +455,6 @@ class Worker:
             outcome.data,
             min_time_limit_s=config.min_time_limit_s,
             max_time_limit_s=config.max_time_limit_s,
-            seed=config.seed,
             max_memory_mb=config.max_memory_mb,
         )
         jsonlog.log(
@@ -454,7 +465,16 @@ class Worker:
             queue_wait_ms=_ms_between(outcome, now),
             time_limit_s=params.time_limit_s,
             num_workers=SUBSTITUTION_WORKERS,
+            # what changes the algorithm, so a dropped or misspelled field shows (counts only)
+            step3=request.step3,
+            absence_rows=None if request.absences is None else len(request.absences),
+            approved_rows=len(request.approved),
+            ignored_fields=outcome.ignored_fields,
         )
+        if outcome.ignored_fields > 0:
+            jsonlog.log(
+                WARNING, "job.unknown_fields", **_ids(address), count=outcome.ignored_fields
+            )
         if request.allow_support_moves:  # conditional deviation (contracts README item 9)
             jsonlog.log(WARNING, "job.support_moves_ignored", **_ids(address))
 
@@ -464,11 +484,7 @@ class Worker:
         began = self.monotonic()
         result = self._run(address, substitute, params.time_limit_s)
         wall_time_ms = round((self.monotonic() - began) * 1000)
-        if result is None:
-            data = rejected_data(address.job_id, ErrorCode.INTERNAL)
-        else:
-            provenance = Provenance(wall_time_ms=wall_time_ms, input_sha256=outcome.input_sha256)
-            data = substitution_data(address.job_id, result, provenance)
+        data = self._substitution_data(address, result, outcome.input_sha256, wall_time_ms)
         completed = self._completed(address, data)
         self._send_completed(completed, address)
         if result is None:  # the engine failed: there is no search telemetry to report
@@ -476,10 +492,64 @@ class Worker:
                 address, completed, job_kind="substitution", wall_time_ms=wall_time_ms
             )
             return
-        stats = result.stats
-        if stats.anomalies > 0:  # an INFEASIBLE / MODEL_INVALID step model is an engine bug
+        self._log_substitution(address, completed, result, wall_time_ms)
+
+    @staticmethod
+    def _substitution_data(
+        address: Address, result: SubstitutionResult | None, digest: str, wall_time_ms: int
+    ) -> dict[str, object]:
+        """The answer; a result that cannot be encoded is an engine bug, answered as internal
+        at once (the offset is committed: timetable would otherwise wait for its watchdog)."""
+        if result is None:
+            return rejected_data(address.job_id, ErrorCode.INTERNAL)
+        provenance = Provenance(wall_time_ms=wall_time_ms, input_sha256=digest)
+        try:
+            return substitution_data(address.job_id, result, provenance)
+        except Exception as exc:  # noqa: BLE001 -- logged with its class and location
             jsonlog.log(
-                WARNING, "engine.substitution_anomaly", **_ids(address), count=stats.anomalies
+                ERROR,
+                "result.encode_failed",
+                **_ids(address),
+                error_class=type(exc).__name__,
+                where=jsonlog.where(exc),
+            )
+            return rejected_data(address.job_id, ErrorCode.INTERNAL)
+
+    def _log_substitution(
+        self,
+        address: Address,
+        completed: Completed,
+        result: SubstitutionResult,
+        wall_time_ms: int,
+    ) -> None:
+        stats = result.stats
+        self_study = sum(p.kind is ProposalKind.SELF_STUDY for p in result.proposals)
+        for step, status in stats.anomalies:  # an INFEASIBLE / MODEL_INVALID step: engine bug
+            jsonlog.log(
+                ERROR,
+                "engine.substitution_anomaly",
+                **_ids(address),
+                step=step,
+                status=status.value,
+                count=len(stats.anomalies),
+            )
+        if stats.stop_reason in {StopReason.STOPPED, StopReason.TIME_LIMIT}:
+            # The best found so far: lessons left open are self-study without a full search.
+            jsonlog.log(
+                WARNING,
+                "job.partial",
+                **_ids(address),
+                stop_reason=stats.stop_reason.value,
+                self_study_count=self_study,
+            )
+        if stats.absences_completed or stats.overlays_ignored:
+            # The request was read the safe way (absent all day) or had moot overlays.
+            jsonlog.log(
+                WARNING,
+                "job.request_repaired",
+                **_ids(address),
+                absences_completed=stats.absences_completed,
+                overlays_ignored=stats.overlays_ignored,
             )
         self._log_completed(
             address,
@@ -489,9 +559,9 @@ class Worker:
             stop_reason=stats.stop_reason.value,
             num_workers=stats.num_workers,
             step=result.step,
-            proposals=len(result.proposals),
-            self_study=sum(p.kind is ProposalKind.SELF_STUDY for p in result.proposals),
-            covered=list(stats.covered),
+            proposal_count=len(result.proposals),
+            self_study_count=self_study,
+            covered_by_step=list(stats.covered),
             cp_runs=stats.runs,
         )
 
@@ -678,7 +748,12 @@ class Worker:
         self._send([completed.message], self.config.completed_flush_timeout_s, COMPLETED, address)
 
     def _send_dlq(
-        self, message: InboundMessage, route: Route, error_class: str, address: Address | None
+        self,
+        message: InboundMessage,
+        route: Route,
+        error_class: str,
+        address: Address | None,
+        reason: str | None = None,
     ) -> None:
         """Best effort: the DLQ is diagnostics only; one attempt, then log and move on.
 
@@ -687,7 +762,11 @@ class Worker:
         """
         try:
             dlq = dlq_message(
-                message, topic=route.dlq_topic, error_class=error_class, models=route.dlq_models
+                message,
+                topic=route.dlq_topic,
+                error_class=error_class,
+                models=route.dlq_models,
+                reason=reason,
             )
             self.producer.send([dlq], self._flush_timeout(self.config.started_flush_timeout_s))
         except FatalKafkaError:

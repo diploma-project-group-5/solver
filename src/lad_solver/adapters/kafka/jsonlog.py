@@ -30,7 +30,8 @@ ALLOWED_FIELDS: Final = frozenset(
         "status",
         "error_code",
         "error_class",
-        # librdkafka error names (e.g. "_TRANSPORT") or fixed literals only, never payload text
+        # librdkafka error names (e.g. "_TRANSPORT") or fixed literals (a rejection's broken rule,
+        # a pydantic error type with its field path) only, never payload text
         "reason",
         "queue_wait_ms",
         "wall_time_ms",
@@ -68,13 +69,19 @@ ALLOWED_FIELDS: Final = frozenset(
         "zero_day_after",
         "phase_b_retry_days",
         # job kind and the substitution summary (ADR 2026-11-15-solver-substitution-engine):
-        # counts and enum values, never who is absent or which lessons
+        # counts, flags and enum values, never who is absent or which lessons
         "job_kind",
         "step",
-        "proposals",
-        "self_study",
-        "covered",
+        "step3",
+        "absence_rows",
+        "approved_rows",
+        "ignored_fields",
+        "proposal_count",
+        "self_study_count",
+        "covered_by_step",
         "cp_runs",
+        "absences_completed",
+        "overlays_ignored",
     }
 )
 

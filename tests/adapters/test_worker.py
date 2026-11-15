@@ -7,7 +7,7 @@ import logging
 import threading
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
-from typing import cast
+from typing import Any, cast
 from uuid import UUID
 
 import pytest
@@ -34,10 +34,11 @@ from kafka_support import (
 )
 
 from lad_solver.adapters.kafka import jsonlog, mapping
+from lad_solver.adapters.kafka import worker as worker_module
 from lad_solver.adapters.kafka.mapping import event_id
 from lad_solver.adapters.kafka.ports import InboundMessage
 from lad_solver.domain.problem import Params, Problem
-from lad_solver.domain.result import CoverageVerdict, Lesson, Result, SolveStatus
+from lad_solver.domain.result import CoverageVerdict, Lesson, Result, SolveStatus, StopReason
 from lad_solver.domain.substitution import (
     Proposal,
     ProposalKind,
@@ -521,13 +522,14 @@ def test_substitution_stats_carry_provenance_only() -> None:
     assert (stats["model_version"], stats["stop_reason"]) == ("a+a2+b+s/2026-11-15", "completed")
 
 
-def test_substitution_engine_gets_the_clamped_limit_and_the_configured_seed() -> None:
+def test_substitution_engine_gets_the_clamped_limit_and_seed_0_whatever_the_build_seed() -> None:
+    """The ADR fixes the substitution search (one worker, seed 0): SOLVER_SEED is for builds."""
     h = harness(seed=7, max_memory_mb=256)
 
     h.run(_substitution(substitution_request(time_limit_s=3600)))
 
     [(request, params)] = h.substitution.calls
-    assert (params.time_limit_s, params.random_seed, params.max_memory_mb) == (180.0, 7, 256)
+    assert (params.time_limit_s, params.random_seed, params.max_memory_mb) == (180.0, 0, 256)
     assert request.absent_teacher_id == "t-1"
 
 
@@ -687,7 +689,9 @@ def test_substitution_engine_failure_is_internal_and_never_retried() -> None:
 
 
 def test_sigterm_during_a_substitution_answers_the_best_known() -> None:
-    """SIGTERM mid-job: the engine stops, whatever it fixed stays, the rest is self-study."""
+    """SIGTERM while the engine runs: it is stopped and its best known answer is published (here
+    nothing was fixed yet, so all self-study; proposals fixed before a stop are kept, see
+    test_substitution_engine.test_a_stop_after_step_1_keeps_what_step_1_fixed)."""
     substitution = FakeSubstitution(Journal(), wait_for_stop=True)
     h = harness(substitution=substitution)
     h.consumer.on_idle = None
@@ -742,10 +746,135 @@ def test_substitution_logs_counts_never_who_is_absent(capsys: pytest.CaptureFixt
     [done] = [x for x in lines if x["msg"] == "job.completed"]
     assert (started["job_kind"], started["num_workers"]) == ("substitution", 1)
     assert (done["job_kind"], done["status"], done["step"]) == ("substitution", "OPTIMAL", 1)
-    assert (done["proposals"], done["self_study"], done["covered"]) == (1, 0, [1, 0, 0])
+    assert (done["proposal_count"], done["self_study_count"], done["covered_by_step"]) == (
+        1,
+        0,
+        [1, 0, 0],
+    )
     assert done["cp_runs"] == 1
+    assert (started["step3"], started["approved_rows"], started["ignored_fields"]) == (False, 0, 0)
+    assert "absence_rows" not in started  # no absences in the request (None is never written)
     for leaked in ('"t-1"', '"t-2"', '"c-5a"', "2026-11-11"):
         assert leaked not in out
+
+
+def _logs(capsys: pytest.CaptureFixture[str], msg: str) -> list[Json]:
+    lines = [json.loads(x) for x in capsys.readouterr().out.splitlines() if x.startswith("{")]
+    return [x for x in lines if x["msg"] == msg]
+
+
+def test_a_rejected_substitution_logs_and_dlq_tags_the_broken_rule(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    h = harness()
+    # c-9b L2 is not a lesson of the template
+    h.run(_substitution(substitution_request(lessons=[{"class_id": "c-9b", "lesson_no": 2}])))
+
+    [rejected] = _logs(capsys, "job.rejected")
+    assert rejected["level"] == "warning"
+    assert (rejected["error_class"], rejected["reason"]) == (
+        "referential_integrity",
+        "a lesson to cover is not a lesson of the date",
+    )
+    [dead] = h.producer.dlq(SUBSTITUTION_DLQ_TOPIC)
+    assert dict(dead.headers)["x-error-reason"] == b"a lesson to cover is not a lesson of the date"
+
+
+def test_a_rejection_reason_names_the_field_never_the_value(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    marker = "Іваненко-MARKER"
+    h = harness()
+
+    h.run(_substitution(substitution_request(absent_teacher_id=marker)))
+
+    out = capsys.readouterr().out
+    assert marker not in out
+    assert "string_pattern_mismatch at data.absent_teacher_id" in out
+    for message in h.producer.sent:
+        assert marker.encode() not in (message.value or b"")
+        assert all(marker.encode() not in value for _, value in message.headers)
+
+
+def test_unknown_data_fields_are_warned_about(capsys: pytest.CaptureFixture[str]) -> None:
+    """A misspelt optional key silently turns a feature off (no step 3): say so in the logs."""
+    h = harness()
+    document = with_data(substitution_request(), lambda d: d.update(non_school_date=[]))
+
+    h.run(_substitution(document))
+
+    out = capsys.readouterr().out
+    lines = [json.loads(x) for x in out.splitlines()]
+    [warned] = [x for x in lines if x["msg"] == "job.unknown_fields"]
+    [started] = [x for x in lines if x["msg"] == "job.started"]
+    assert (warned["level"], warned["count"]) == ("warning", 1)
+    assert (started["ignored_fields"], started["step3"]) == (1, False)
+    assert "non_school_date" not in out  # a count, never the producer's key
+
+
+def _engine_result(**stats: Any) -> SubstitutionResult:  # noqa: ANN401 - SubstitutionStats fields
+    slot = Slot(dt.date(2026, 11, 11), "c-5a", 2)
+    status = SolveStatus.OPTIMAL if not stats else SolveStatus.FEASIBLE
+    return SubstitutionResult(
+        status, (Proposal(slot, ProposalKind.SELF_STUDY, 2),), SubstitutionStats(**stats)
+    )
+
+
+def test_an_engine_anomaly_is_logged_as_an_error_with_its_step(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    anomalous = _engine_result(anomalies=((2, SolveStatus.INFEASIBLE),))
+    h = harness(substitution=FakeSubstitution(Journal(), result=anomalous))
+
+    h.run(_substitution())
+
+    [anomaly] = _logs(capsys, "engine.substitution_anomaly")
+    assert (anomaly["level"], anomaly["step"], anomaly["status"]) == ("error", 2, "INFEASIBLE")
+    assert _completed_data(h)["status"] == "FEASIBLE"
+
+
+@pytest.mark.parametrize("reason", [StopReason.STOPPED, StopReason.TIME_LIMIT])
+def test_a_partial_answer_is_logged(capsys: pytest.CaptureFixture[str], reason: StopReason) -> None:
+    h = harness(substitution=FakeSubstitution(Journal(), result=_engine_result(stop_reason=reason)))
+
+    h.run(_substitution())
+
+    [partial] = _logs(capsys, "job.partial")
+    assert (partial["level"], partial["stop_reason"], partial["self_study_count"]) == (
+        "warning",
+        reason.value,
+        1,
+    )
+
+
+def test_a_repaired_request_is_logged(capsys: pytest.CaptureFixture[str]) -> None:
+    repaired = _engine_result(absences_completed=1, overlays_ignored=2)
+    h = harness(substitution=FakeSubstitution(Journal(), result=repaired))
+
+    h.run(_substitution())
+
+    [logged] = _logs(capsys, "job.request_repaired")
+    assert (logged["absences_completed"], logged["overlays_ignored"]) == (1, 2)
+
+
+def test_a_result_that_cannot_be_encoded_is_answered_internal_at_once(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The offset is already committed: crashing here would leave the job to the watchdog."""
+
+    def broken(*_args: object) -> dict[str, object]:
+        msg = "bug"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(worker_module, "substitution_data", broken)
+    h = harness()
+
+    assert h.run(_substitution()) == 0
+
+    data = _completed_data(h)
+    assert (data["status"], data["error"]) == ("MODEL_INVALID", {"code": "internal"})
+    [failed] = _logs(capsys, "result.encode_failed")
+    assert (failed["level"], failed["error_class"]) == ("error", "RuntimeError")
 
 
 def test_build_after_a_substitution_is_solved_too() -> None:

@@ -8,13 +8,23 @@ import hashlib
 import json
 import math
 import re
-from collections.abc import Iterator, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Iterator, Sequence
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from functools import cache
 from types import UnionType
-from typing import Annotated, Any, Final, Protocol, TypeAliasType, Union, get_args, get_origin
+from typing import (
+    Annotated,
+    Any,
+    Final,
+    Protocol,
+    TypeAliasType,
+    Union,
+    cast,
+    get_args,
+    get_origin,
+)
 from uuid import UUID, uuid5
 
 from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError
@@ -128,11 +138,16 @@ class Poison:
 
 @dataclass(frozen=True, slots=True)
 class Rejected:
-    """A job that is answered with MODEL_INVALID without solving (one attempt, no retries)."""
+    """A job that is answered with MODEL_INVALID without solving (one attempt, no retries).
+
+    ``reason`` names the broken rule for the logs and the DLQ header: a fixed literal, or a
+    pydantic error type with its field path (names and indices, never input values).
+    """
 
     address: Address
     code: ErrorCode
     error_class: str
+    reason: str | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,6 +174,7 @@ class SubstitutionAccepted:
     request: SubstitutionRequest
     input_sha256: str
     requested_at: datetime | None
+    ignored_fields: int = 0  # keys of ``data`` the contract does not know (logged as a count)
 
     @property
     def queue_deadline_at(self) -> datetime:
@@ -263,26 +279,34 @@ def parse_build_request(raw: bytes | None) -> ParseOutcome:
     if address is None:
         return Poison("invalid_envelope")
     rejection = _envelope_rejection(document, BUILD_REQUESTED)
-    if rejection is None:
-        try:
-            event = BuildRequested.model_validate(document)
-            problem = to_problem(event.data)
-            digest = input_sha256(event.data)  # encodes every validated string
-        except ValidationError:
-            rejection = (ErrorCode.INVALID_PAYLOAD, "validation")
-        except InvalidInputError:
-            rejection = (ErrorCode.INVALID_PAYLOAD, "referential_integrity")
-        except UnicodeEncodeError:
-            rejection = (ErrorCode.INVALID_PAYLOAD, "invalid_unicode")
-        else:
-            return Accepted(address, event.data, problem, digest, event.time)
-    return Rejected(address, *rejection)
+    if rejection is not None:
+        return Rejected(address, *rejection)
+
+    def accept() -> Accepted:
+        event = BuildRequested.model_validate(document)
+        problem = to_problem(event.data)
+        digest = input_sha256(event.data)  # encodes every validated string
+        return Accepted(address, event.data, problem, digest, event.time)
+
+    return _checked(address, accept)
+
+
+def _checked[T](address: Address, accept: Callable[[], T]) -> T | Rejected:
+    """Validate a payload; each failure becomes the job's invalid_payload answer with a reason."""
+    try:
+        return accept()
+    except ValidationError as exc:
+        return Rejected(address, ErrorCode.INVALID_PAYLOAD, "validation", _validation_reason(exc))
+    except (InvalidInputError, InvalidRequestError) as exc:
+        return Rejected(address, ErrorCode.INVALID_PAYLOAD, "referential_integrity", str(exc))
+    except UnicodeEncodeError:
+        return Rejected(address, ErrorCode.INVALID_PAYLOAD, "invalid_unicode")
 
 
 def parse_substitution_request(raw: bytes | None) -> Poison | Rejected | SubstitutionAccepted:
     """Classify a substitution job as a build job is classified (contracts 0.5.0).
 
-    The request must describe one consistent week (its baseline week builds) before
+    The request must describe one consistent week (``baseline_week``, the one gate) before
     ``solve.started`` is promised; otherwise the job is answered with invalid_payload.
     """
     document = _load(raw)
@@ -292,21 +316,27 @@ def parse_substitution_request(raw: bytes | None) -> Poison | Rejected | Substit
     if address is None:
         return Poison("invalid_envelope")
     rejection = _envelope_rejection(document, SUBSTITUTION_REQUESTED)
-    if rejection is None:
-        try:
-            event = SubstitutionRequested.model_validate(document)
-            request = to_substitution(event.data)
-            baseline_week(request)
-            digest = input_sha256(event.data)
-        except ValidationError:
-            rejection = (ErrorCode.INVALID_PAYLOAD, "validation")
-        except InvalidInputError, InvalidRequestError:
-            rejection = (ErrorCode.INVALID_PAYLOAD, "referential_integrity")
-        except UnicodeEncodeError:
-            rejection = (ErrorCode.INVALID_PAYLOAD, "invalid_unicode")
-        else:
-            return SubstitutionAccepted(address, event.data, request, digest, event.time)
-    return Rejected(address, *rejection)
+    if rejection is not None:
+        return Rejected(address, *rejection)
+
+    def accept() -> SubstitutionAccepted:
+        event = SubstitutionRequested.model_validate(document)
+        request = to_substitution(event.data)
+        baseline_week(request)
+        digest = input_sha256(event.data)
+        data = cast("dict[str, object]", document["data"])  # an object: the model validated it
+        ignored = sum(1 for key in data if key not in SubstitutionRequestedData.model_fields)
+        return SubstitutionAccepted(address, event.data, request, digest, event.time, ignored)
+
+    return _checked(address, accept)
+
+
+def _validation_reason(exc: ValidationError) -> str:
+    """The first error as "type at a.b.0": field names and indices, never input values (every
+    payload field is declared and unknown keys are ignored, so a path never quotes input)."""
+    [first, *_] = exc.errors(include_url=False, include_input=False, include_context=False)
+    path = ".".join(str(part) for part in first["loc"])
+    return f"{first['type']} at {path}"[:200]
 
 
 def _unique(kind: str, ids: list[str]) -> set[str]:
@@ -389,43 +419,21 @@ def _capacity(capacity: AlertCapacity | PassportCapacity) -> Capacity:
 
 
 def to_substitution(data: SubstitutionRequestedData) -> SubstitutionRequest:
-    """The request as engine input; ids and dates resolve, the week itself is checked later.
+    """The request as engine input; ``baseline_week`` then checks that it is one coherent week.
 
-    Every date of the template's week, overlays, absences and non-school dates lies in
-    ``iso_week``; ``absence_dates`` may reach beyond it (all dates of one absence).
+    Only the snapshot must be closed (unique ids, rows that resolve): the template and the
+    approved substitutions may name ids that left the snapshot (an archived class, a deleted
+    teacher), which validator-lib reports as conflicts the week already has.
     """
     school = _school(data, TimetableKind(data.template.kind))
-    week = iso_week_dates(data.iso_week)
-    classes = {c.id for c in school.classes}
-    subjects = {s.id for s in school.subjects}
-    teachers = {t.id for t in school.teachers}
-    non_school = None if data.non_school_dates is None else frozenset(data.non_school_dates)
-    _require(data.absent_teacher_id in teachers, "the absent teacher is not in the snapshot")
-    _require(data.date in week, "the date is not in iso_week")
-    _require(data.date.isoweekday() in school.school_days, "the date is not a school day")
-    _require(non_school is None or data.date not in non_school, "the date is a non-school date")
-    _require(data.date in data.absence_dates, "the date is not one of absence_dates")
-    _require(non_school is None or non_school <= set(week), "a non-school date outside iso_week")
-    _require(all(x.class_id in classes for x in data.lessons), "a lesson of an unknown class")
-    for x in data.template.lessons:
-        known = x.class_id in classes and x.subject_id in subjects and x.teacher_id in teachers
-        _require(known, "a template lesson references an unknown id")
-    _require(
-        all(f.class_id in classes for f in data.template.day_formats),
-        "a day format of an unknown class",
-    )
-    for a in data.approved_substitutions:
-        _require(a.class_id in classes and a.date in week, "an approved substitution outside")
-        _require(a.teacher_id is None or a.teacher_id in teachers, "an unknown substitute")
-        _require(a.moved_to is None or a.moved_to.date in week, "moved_to outside iso_week")
-    for a in data.absences or ():
-        _require(a.teacher_id in teachers and a.date in week, "an absence outside the snapshot")
+    if data.date not in iso_week_dates(data.iso_week):
+        msg = "the date is not in iso_week"
+        raise InvalidInputError(msg)
     return SubstitutionRequest(
         school=school,
         date=data.date,
         absent_teacher_id=data.absent_teacher_id,
         lessons=tuple(Slot(data.date, x.class_id, x.lesson_no) for x in data.lessons),
-        week=week,
         not_before=data.not_before,
         absence_dates=frozenset(data.absence_dates),
         template_lessons=tuple(
@@ -454,14 +462,11 @@ def to_substitution(data: SubstitutionRequestedData) -> SubstitutionRequest:
             )
             for a in data.absences
         ),
-        non_school_dates=non_school,
+        non_school_dates=None
+        if data.non_school_dates is None
+        else frozenset(data.non_school_dates),
         allow_support_moves=data.allow_support_moves,
     )
-
-
-def _require(condition: bool, what: str) -> None:  # noqa: FBT001 - a guard
-    if not condition:
-        raise InvalidInputError(what)
 
 
 _NOT_PART_OF_INPUT: Final = frozenset({"job_id", "queue_deadline_at", "time_limit_s"})
@@ -502,18 +507,22 @@ def clamp_time_limit(requested: int, min_time_limit_s: int, max_time_limit_s: in
     return max(min_time_limit_s, min(max_time_limit_s, requested))
 
 
+# The ADR fixes the substitution search: one worker and random_seed 0, whatever SOLVER_SEED says
+# (that knob is for builds), so a substitution answer never depends on the deployment.
+SUBSTITUTION_SEED: Final = 0
+
+
 def substitution_params(
     data: SubstitutionRequestedData,
     *,
     min_time_limit_s: int,
     max_time_limit_s: int,
-    seed: int,
     max_memory_mb: int | None = None,
 ) -> SubstitutionParams:
-    """One worker and a deterministic budget of ``time_limit_s`` deterministic seconds (ADR)."""
+    """One worker, seed 0 and a budget of ``time_limit_s`` deterministic seconds (ADR)."""
     limit = clamp_time_limit(data.time_limit_s, min_time_limit_s, max_time_limit_s)
     return SubstitutionParams(
-        time_limit_s=float(limit), random_seed=seed, max_memory_mb=max_memory_mb
+        time_limit_s=float(limit), random_seed=SUBSTITUTION_SEED, max_memory_mb=max_memory_mb
     )
 
 
@@ -856,11 +865,14 @@ def dlq_message(
     topic: str,
     error_class: str,
     models: Sequence[type[BaseModel]],
+    reason: str | None = None,
 ) -> OutboundMessage:
+    """``reason``: the rule a rejected request broke (a fixed literal or a field path)."""
     headers = (
         ("x-error-class", error_class.encode()),
         ("x-original-topic", message.topic.encode()),
         ("x-original-partition", str(message.partition).encode()),
         ("x-original-offset", str(message.offset).encode()),
+        *((("x-error-reason", reason.encode()),) if reason is not None else ()),
     )
     return OutboundMessage(topic, message.key, dlq_value(message.value, models), headers)

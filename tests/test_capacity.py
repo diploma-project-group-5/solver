@@ -31,7 +31,9 @@ SEED_INPUT_SHA256 = {
     TimetableKind.MAIN: "b3b4d07e42b9c6efc95ff13ce820f4ba3bb6e361750da195628bc94713349750",
     TimetableKind.ALERT: "a806b74baca2b1b0418564f3b4712cbebd6145646f7307388770428f5304a89f",
 }
-# sha256 of str(model.proto) of phase A, recorded on solver 0.3.0 before the move (ortools 9.15).
+# sha256 of str(model.proto) of phase A, recorded on solver 0.3.0 (ce0ed47) before the move, on
+# ortools 9.15. A deliberate change of phase A, or an ortools bump that changes the text format,
+# re-records them: build the same models on the commit before the change and compare.
 PHASE_A_MODEL_SHA256 = {
     (TimetableKind.MAIN, False): "09d8f848c37269a312d6de49461e518ec09a8dba9fb7a2ac4dd4a94231bc311d",
     (TimetableKind.MAIN, True): "85d5036ea79860e826f0d62abc99a1245f67988d82599c5a04dbfe4bede8ae88",
@@ -91,6 +93,22 @@ def test_the_constraint_holds_exactly_at_the_limit(
     room = day_room(AlertLimits(60, 66), 2, max_pupils=60, max_teachers=teachers_on_site)
 
     add_day_capacity(model, 1, 60, sum(on_site), room)
+
+    _, info = run(model, SolverConfig(time_limit_s=5), has_objective=False)
+    assert (info.status.value in {"OPTIMAL", "FEASIBLE"}) == feasible
+
+
+@pytest.mark.parametrize(
+    ("pupils", "feasible"), [(60, True), (61, False)], ids=["seats-at-limit", "seats-over-by-one"]
+)
+def test_the_seats_condition_holds_exactly_at_the_limit(pupils: int, *, feasible: bool) -> None:
+    """1.2: pupils of in-person classes <= seats, apart from the passport (which has room)."""
+    model = cp_model.CpModel()
+    present = model.new_bool_var("class")
+    model.add(present == 1)
+    room = day_room(AlertLimits(60, 1000), 2, max_pupils=pupils, max_teachers=1)
+
+    add_day_capacity(model, 1, pupils * present, 0, room)
 
     _, info = run(model, SolverConfig(time_limit_s=5), has_objective=False)
     assert (info.status.value in {"OPTIMAL", "FEASIBLE"}) == feasible

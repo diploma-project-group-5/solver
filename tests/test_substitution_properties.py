@@ -33,14 +33,14 @@ from lad_solver.adapters.kafka.mapping import (
     substitution_data,
 )
 from lad_solver.app.substitute import substitute
-from lad_solver.domain.result import SolveStatus
+from lad_solver.domain.result import SolveStatus, StopReason
 from lad_solver.domain.substitution import (
     ProposalKind,
     SubstitutionParams,
     SubstitutionRequest,
     SubstitutionResult,
 )
-from substitution_builders import date_of, envelope, random_request
+from substitution_builders import date_of, envelope, random_request, tight_request
 
 type Json = dict[str, Any]
 
@@ -74,12 +74,12 @@ def test_there_is_always_a_solution_with_one_proposal_per_lesson(seed: int, kind
     result = substitute(request, PARAMS)
 
     assert result.status in {SolveStatus.OPTIMAL, SolveStatus.FEASIBLE}
+    assert (result.stats.stop_reason, result.stats.anomalies) == (StopReason.COMPLETED, ())
     assert [p.slot for p in result.proposals] == list(request.lessons)
-    assert result.step == max(p.step for p in result.proposals)
     for p in result.proposals:
         assert (p.kind is ProposalKind.TEACHER) == (p.step == 1)
         if p.kind is ProposalKind.SELF_STUDY:
-            assert p.step == request.last_step
+            assert p.step == request.self_study_step
         if p.kind is ProposalKind.MOVED:
             assert p.moved_to is not None
             assert (p.moved_to.date == request.date) == (p.step == 2)
@@ -91,8 +91,9 @@ def test_there_is_always_a_solution_with_one_proposal_per_lesson(seed: int, kind
 def test_steps_never_add_self_study_and_keep_what_they_fixed(seed: int, kind: str) -> None:
     _, request = request_of(seed, kind)
 
-    runs = [substitute(request, replace(PARAMS, last_step=k)) for k in (1, 2, 3)]
+    runs = [substitute(request, replace(PARAMS, stop_after_step=k)) for k in (1, 2, 3)]
 
+    assert all(r.stats.anomalies == () for r in runs)
     self_study = [_self_study(r) for r in runs]
     assert self_study == sorted(self_study, reverse=True)
     for k, run in enumerate(runs):
@@ -109,6 +110,7 @@ def test_the_same_request_gives_the_same_answer(seed: int, kind: str) -> None:
     first, second = substitute(request, PARAMS), substitute(request, PARAMS)
 
     assert (first.status, first.proposals) == (second.status, second.proposals)
+    assert first.stats.anomalies == ()
 
 
 def proposal_rows(data: Json, result: SubstitutionResult) -> list[Json]:
@@ -164,10 +166,9 @@ def test_a_job_after_approved_substitutions_still_answers(seed: int, kind: str) 
 
     result = substitute(request, PARAMS)
 
-    approved = {(a["date"], a["class_id"], a["lesson_no"]) for a in data["approved_substitutions"]}
     assert result.status in {SolveStatus.OPTIMAL, SolveStatus.FEASIBLE}
-    for p in result.proposals:
-        assert (p.slot.date.isoformat(), p.slot.class_id, p.slot.lesson_no) not in approved
+    assert result.stats.anomalies == ()
+    assert [p.slot for p in result.proposals] == list(request.lessons)
 
 
 # ---------------------------------------------------------------- golden, one batch
@@ -176,19 +177,31 @@ GOLDEN_SEEDS = range(60)
 
 
 @cache
-def _golden_cases() -> dict[str, tuple[Json, Json]]:
-    cases: dict[str, tuple[Json, Json]] = {}
+def _golden_requests() -> dict[str, Json]:
+    requests: dict[str, Json] = {}
     for seed in GOLDEN_SEEDS:
         for kind in ("main", "alert"):
-            for name, data in (
-                (f"{kind}-{seed}", random_request(seed, kind=kind)),
-                (f"{kind}-{seed}-chained", chained(seed, kind)),
-            ):
-                if not data["lessons"]:
-                    continue
-                result = substitute(parse(data), PARAMS)
-                cases[name] = substitution_golden.weeks(data, proposal_rows(data, result))
-    return cases
+            requests[f"{kind}-{seed}"] = random_request(seed, kind=kind)
+            requests[f"{kind}-{seed}-chained"] = chained(seed, kind)
+            requests[f"{kind}-{seed}-tight"] = tight_request(seed, kind)[0]
+    return {name: data for name, data in requests.items() if data["lessons"]}
+
+
+@cache
+def _golden_answers() -> dict[str, list[Json]]:
+    return {
+        name: proposal_rows(data, substitute(parse(data), PARAMS))
+        for name, data in _golden_requests().items()
+    }
+
+
+@cache
+def _golden_cases() -> dict[str, tuple[Json, Json]]:
+    requests = _golden_requests()
+    return {
+        name: substitution_golden.weeks(requests[name], rows)
+        for name, rows in _golden_answers().items()
+    }
 
 
 def test_random_weeks_cover_moves_and_capacity_pressure() -> None:
@@ -206,7 +219,28 @@ def test_every_answer_on_random_weeks_adds_no_conflict() -> None:
 
     added = {name: substitution_golden.added(o) for name, o in outcomes.items()}
     assert {name: a for name, a in added.items() if a} == {}
-    assert len(added) >= 200
+    assert len(added) >= 300
+
+
+def test_the_batch_puts_the_week_under_pressure() -> None:
+    """Non-vacuous: chained jobs carry approved substitutions, and the tight dates with exactly
+    one place left do take a lesson of the absent teacher (a capacity bug would show there)."""
+    requests = _golden_requests()
+    chained_with_overlays = sum(
+        1
+        for name, data in requests.items()
+        if name.endswith("chained") and data["approved_substitutions"]
+    )
+    tight_taken = 0
+    for seed in GOLDEN_SEEDS:
+        for kind in ("main", "alert"):
+            name = f"{kind}-{seed}-tight"
+            date = tight_request(seed, kind)[1]
+            if seed % 2 and date is not None and name in requests:
+                rows = _golden_answers()[name]
+                tight_taken += any(r.get("moved_to", {}).get("date") == date for r in rows)
+    assert chained_with_overlays >= 60
+    assert tight_taken >= 5
 
 
 @pytest.mark.parametrize("kind", ["main", "alert"])

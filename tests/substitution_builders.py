@@ -12,6 +12,9 @@ import datetime as dt
 import random
 from typing import Any
 
+from lad_solver.domain.problem import AlertLimits
+from lad_solver.domain.substitution import SubstitutionRequest
+
 type Json = dict[str, Any]
 
 ISO_WEEK = "2026-W47"
@@ -174,6 +177,43 @@ def random_request(seed: int, *, kind: str = "main") -> Json:  # noqa: C901, PLR
     return request
 
 
+def tight_request(seed: int, kind: str = "main") -> tuple[Json, str | None]:
+    """``random_request`` with the capacity of one step 3 date at its load: the passport leaves
+    no room for one more person (seed even) or exactly one (seed odd), and in 1.2 the seats are
+    at or below the pupils of that date (a stale seats load). The date is one where the absent
+    teacher is not on site, so moving his lesson there in person needs that room. Returns the
+    request and the date (None when the week has no such date)."""
+    data = random_request(seed, kind=kind)
+    data.setdefault("non_school_dates", [])
+    rng = random.Random(seed ^ 0x5EED)  # noqa: S311 - test data
+    lessons, absent = data["template"]["lessons"], data["absent_teacher_id"]
+    formats = {(f["class_id"], f["day"]): f["in_person"] for f in data["template"]["day_formats"]}
+    window = [
+        x
+        for x in DATES[:5]
+        if x.isoformat() not in data["non_school_dates"]
+        and x.isoformat() != data["date"]
+        and x.isoformat() >= data["not_before"]
+        and not any(
+            (y["teacher_id"], y["day"]) == (absent, x.isoweekday())
+            and formats[y["class_id"], y["day"]]
+            for y in lessons
+        )
+    ]
+    if not window:
+        return data, None
+    date = rng.choice(window)
+    day = date.isoweekday()
+    pupils = _pupils(data["classes"], formats, day)
+    room = seed % 2
+    data["capacity"] = {
+        "passport": _people(data["classes"], lessons, formats, day, data["staff"]) + room
+    }
+    if kind == "alert":
+        data["capacity"] = {"seats": max(0, pupils - rng.choice([0, 1])), **data["capacity"]}
+    return data, date.isoformat()
+
+
 def _formats(
     rng: random.Random, classes: list[Json], lessons: list[Json]
 ) -> dict[tuple[str, int], bool]:
@@ -241,3 +281,103 @@ def _merge(absences: list[Json]) -> list[Json]:
         old, new = merged[key]["lesson_nos"], a["lesson_nos"]
         merged[key]["lesson_nos"] = None if old is None or new is None else sorted({*old, *new})
     return list(merged.values())
+
+
+def request_json(request: SubstitutionRequest) -> Json:
+    """The contract ``data`` of a domain request (test-only inverse of the mapping)."""
+    school = request.school
+    capacity = school.capacity
+    year, week, _ = request.date.isocalendar()
+    data: Json = {
+        "job_id": "5d0b5e1c-0000-4000-8000-000000000999",
+        "date": request.date.isoformat(),
+        "absence_dates": sorted(x.isoformat() for x in request.absence_dates),
+        "absent_teacher_id": request.absent_teacher_id,
+        "lessons": [{"class_id": s.class_id, "lesson_no": s.lesson_no} for s in request.lessons],
+        "not_before": request.not_before.isoformat(),
+        "iso_week": f"{year}-W{week:02d}",
+        "snapshot_version": 1,
+        "time_limit_s": 30,
+        "queue_deadline_at": "2026-11-16T08:10:00+02:00",
+        "school_days": list(school.school_days),
+        "lessons_per_day": school.lessons_per_day,
+        "staff": school.staff,
+        "capacity": (
+            {"seats": capacity.seats, "passport": capacity.passport}
+            if isinstance(capacity, AlertLimits)
+            else {"passport": capacity.passport}
+        ),
+        "classes": [
+            {"id": c.id, "students": c.students, "priority": c.priority} for c in school.classes
+        ],
+        "subjects": [
+            {"id": x.id, "priority_area": x.priority_area, "no_shelter": x.no_shelter}
+            for x in school.subjects
+        ],
+        "teachers": [
+            {
+                "id": t.id,
+                "weekly_limit": t.weekly_limit,
+                "unavailable_days": sorted(t.unavailable_days),
+            }
+            for t in school.teachers
+        ],
+        "rows": [
+            {
+                "class_id": r.class_id,
+                "subject_id": r.subject_id,
+                "teacher_id": r.teacher_id,
+                "hours": r.hours,
+            }
+            for r in school.rows
+        ],
+        "template": {
+            "timetable_id": "9e1f7a20-3c4b-4d5e-8f60-7a8b9c0d1e2f",
+            "kind": school.kind.value,
+            "lessons": [
+                {
+                    "class_id": x.class_id,
+                    "day": x.day,
+                    "lesson_no": x.lesson_no,
+                    "subject_id": x.subject_id,
+                    "teacher_id": x.teacher_id,
+                }
+                for x in request.template_lessons
+            ],
+            "day_formats": [
+                {"class_id": f.class_id, "day": f.day, "in_person": f.in_person}
+                for f in request.template_formats
+            ],
+        },
+        "approved_substitutions": [_overlay_json(o) for o in request.approved],
+        "allow_support_moves": request.allow_support_moves,
+    }
+    if request.absences is not None:
+        data["absences"] = [
+            {
+                "teacher_id": a.teacher_id,
+                "date": a.date.isoformat(),
+                "lesson_nos": None if a.lesson_nos is None else sorted(a.lesson_nos),
+            }
+            for a in request.absences
+        ]
+    if request.non_school_dates is not None:
+        data["non_school_dates"] = sorted(x.isoformat() for x in request.non_school_dates)
+    return data
+
+
+def _overlay_json(overlay: Any) -> Json:  # noqa: ANN401 - a domain Overlay
+    row: Json = {
+        "date": overlay.slot.date.isoformat(),
+        "class_id": overlay.slot.class_id,
+        "lesson_no": overlay.slot.lesson_no,
+        "kind": overlay.kind.value,
+    }
+    if overlay.teacher_id is not None:
+        row["teacher_id"] = overlay.teacher_id
+    if overlay.moved_to is not None:
+        row["moved_to"] = {
+            "date": overlay.moved_to.date.isoformat(),
+            "lesson_no": overlay.moved_to.lesson_no,
+        }
+    return row
