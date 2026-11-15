@@ -51,6 +51,7 @@ from lad_solver.domain.problem import (
 from lad_solver.domain.result import (
     Conflict,
     ConflictRule,
+    CoverageVerdict,
     DayFormat,
     Lesson,
     Result,
@@ -189,6 +190,25 @@ def test_started_event_conforms() -> None:
 def test_completed_event_conforms(data: dict[str, object]) -> None:
     completed = completed_message(ADDRESS, data, now=NOW, topic="solve.status", max_bytes=900_000)
 
+    assert _errors("solve.status.v1.json", decode(completed.message)) == []
+
+
+def test_coverage_summary_stays_out_of_the_event() -> None:
+    # Engine telemetry for the worker logs only: solve.status stats has additionalProperties:false.
+    summary = replace(
+        feasible_result().stats,
+        coverage_verdict=CoverageVerdict.ACCEPTED,
+        coverage_status=SolveStatus.OPTIMAL,
+        zero_day_before=4,
+        zero_day_after=1,
+        phase_b_retry_days=3,
+    )
+    provenance = Provenance(wall_time_ms=12, input_sha256="0" * 64)
+    plain = completed_data(UUID(JOB_ID), feasible_result(), provenance)
+    data = completed_data(UUID(JOB_ID), replace(feasible_result(), stats=summary), provenance)
+
+    assert data["stats"] == plain["stats"]
+    completed = completed_message(ADDRESS, data, now=NOW, topic="solve.status", max_bytes=900_000)
     assert _errors("solve.status.v1.json", decode(completed.message)) == []
 
 

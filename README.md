@@ -16,6 +16,11 @@ src/lad_solver/
 tests/       pytest + hypothesis; `test_architecture.py` enforces the layering
 ```
 
+Logs: only the worker logs, as JSON lines on stdout with an allow-list of fields
+(`adapters/kafka/jsonlog.py`); job ids come from the job context, also in the solve thread. The engine
+(`domain`, `model`, `app`) has no `logging`: it reports through `Stats` (e.g. the coverage step verdict and
+the phase B retry days, counts only), which the worker writes to `job.completed`.
+
 ## Development
 
 Requires [uv](https://docs.astral.sh/uv/) (it installs Python 3.14 itself).

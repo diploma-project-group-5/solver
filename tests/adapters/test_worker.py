@@ -2,7 +2,9 @@
 
 import hashlib
 import json
+import logging
 import threading
+from dataclasses import dataclass, field, replace
 from uuid import UUID
 
 import pytest
@@ -14,12 +16,17 @@ from kafka_support import (
     build_request,
     decode,
     encode,
+    feasible_result,
     harness,
     with_data,
 )
 
+from lad_solver.adapters.kafka import jsonlog
 from lad_solver.adapters.kafka.mapping import event_id
-from lad_solver.domain.result import Lesson, Result, SolveStatus
+from lad_solver.domain.problem import Params, Problem
+from lad_solver.domain.result import CoverageVerdict, Lesson, Result, SolveStatus
+from lad_solver.model.progress import Progress
+from lad_solver.model.stop import StopHandle
 
 
 def test_accepted_job_publishes_started_commits_then_solves_then_completes() -> None:
@@ -324,3 +331,95 @@ def test_unparseable_poison_with_personal_data_is_not_copied_to_the_dlq() -> Non
     value = h.producer.dlq()[0].value or b""
     assert b"signature" not in value
     assert "Іваненко".encode() not in value
+
+
+BASE_LOG_KEYS = frozenset({"time", "level", "logger", "msg"})
+
+
+def _entries(out: str) -> list[dict[str, object]]:
+    return [json.loads(line) for line in out.splitlines()]
+
+
+@dataclass
+class _LoggingEngine(FakeEngine):
+    """Logs from inside the engine, the way any lad_solver.app / model logger would."""
+
+    thread_names: list[str] = field(default_factory=list[str])
+
+    def __call__(
+        self, problem: Problem, params: Params, stop: StopHandle, progress: Progress
+    ) -> Result:
+        self.thread_names.append(threading.current_thread().name)
+        logging.getLogger("lad_solver.app.fake").info("engine.event")
+        return super().__call__(problem, params, stop, progress)
+
+
+def test_engine_logs_from_the_solve_thread_carry_the_job_ids(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    engine = _LoggingEngine(Journal())
+    h = harness(engine=engine)
+
+    assert h.run(encode(build_request()), b"\x00not json at all") == 0
+
+    assert engine.thread_names == ["lad-solve"]
+    entries = _entries(capsys.readouterr().out)
+    [event] = [e for e in entries if e["msg"] == "engine.event"]
+    assert (event["job_id"], event["school_id"], event["correlation_id"]) == (
+        JOB_ID,
+        SCHOOL_ID,
+        "req-5f2c9a",
+    )
+    poison = [e for e in entries if e["msg"] in {"message.poison", "message.done"}]
+    assert len(poison) == 2
+    for entry in poison:  # the next message does not inherit the previous job's context
+        assert {"job_id", "school_id", "correlation_id"}.isdisjoint(entry)
+
+
+def _with_coverage_stats(**changes: object) -> FakeEngine:
+    result = feasible_result()
+    stats = replace(
+        result.stats,
+        coverage_verdict=CoverageVerdict.ACCEPTED,
+        coverage_status=SolveStatus.FEASIBLE,
+        zero_day_before=3,
+        zero_day_after=1,
+        phase_b_retry_days=2,
+    )
+    return FakeEngine(Journal(), result=replace(result, stats=replace(stats, **changes)))
+
+
+def test_job_completed_reports_the_coverage_step_and_phase_b_retries(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    h = harness(engine=_with_coverage_stats())
+
+    assert h.run(encode(build_request())) == 0
+
+    entries = _entries(capsys.readouterr().out)
+    [completed] = [e for e in entries if e["msg"] == "job.completed"]
+    assert completed["coverage_verdict"] == "accepted"
+    assert completed["coverage_status"] == "FEASIBLE"
+    assert (completed["zero_day_before"], completed["zero_day_after"]) == (3, 1)
+    assert completed["phase_b_retry_days"] == 2
+    for entry in entries:
+        assert set(entry) <= BASE_LOG_KEYS | jsonlog.ALLOWED_FIELDS
+    assert not [e for e in entries if e["msg"] == "engine.coverage_anomaly"]
+
+
+@pytest.mark.parametrize("status", [SolveStatus.INFEASIBLE, SolveStatus.MODEL_INVALID])
+def test_impossible_coverage_status_is_a_warning(
+    status: SolveStatus, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A hinted feasible model cannot be INFEASIBLE / MODEL_INVALID: an engine bug worth seeing.
+    engine = _with_coverage_stats(coverage_verdict=CoverageVerdict.KEPT, coverage_status=status)
+    h = harness(engine=engine)
+
+    assert h.run(encode(build_request())) == 0
+
+    [anomaly] = [
+        e for e in _entries(capsys.readouterr().out) if e["msg"] == "engine.coverage_anomaly"
+    ]
+    assert anomaly["level"] == "warning"
+    assert anomaly["coverage_status"] == status.value
+    assert anomaly["job_id"] == JOB_ID
