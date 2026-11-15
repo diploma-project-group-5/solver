@@ -15,6 +15,8 @@ from types import SimpleNamespace
 from typing import cast
 
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 
 import golden
 from builders import OTHER, PRIO, klass, problem, row, teacher
@@ -71,9 +73,11 @@ def _no_classes(*_args: object) -> list[str]:
 
 
 def _step1(monkeypatch: pytest.MonkeyPatch, p: Problem, params: Params = PARAMS) -> Result:
-    """Phase A alone (no reserve, no coverage step): the baseline a kept plan is compared with."""
+    """Phase A alone: the ladder with the same budget, its reserve unused, no coverage step.
+
+    The baseline a kept plan is compared with.
+    """
     with monkeypatch.context() as m:
-        m.setattr(solve_module, "static_orphans", _no_classes)
         m.setattr(solve_module, "zero_day_classes", _no_classes)
         return solve(p, params)
 
@@ -145,7 +149,10 @@ def test_coverage_soft_when_capacity_exact() -> None:
 
 
 def test_coverage_skipped_without_zero_day_classes(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Every class has priority lessons (no reserve) and the shelter takes both (no zero-day class).
+    # Every class has priority lessons and the shelter takes both (no zero-day class): the ladder
+    # still ends a reserve early (known only after it), and the step does not run.
+    clock = _freeze(monkeypatch)
+    configs, _ = _ladder_spy(monkeypatch)
     monkeypatch.setattr(solve_module, "solve_coverage", _must_not_run)
     p = problem(
         classes=(klass("a", 20, priority=True), klass("b", 21)),
@@ -154,9 +161,11 @@ def test_coverage_skipped_without_zero_day_classes(monkeypatch: pytest.MonkeyPat
         days=(1,),
     )
     assert static_orphans(build_index(p)) == []
-    result = solve(p, PARAMS)
+    result = solve(p, PARAMS, progress=Progress(clock=clock))
     assert result.status is SolveStatus.OPTIMAL
     assert _zero_day(p, result) == []
+    ladder = _phase_a_budget(PARAMS) - _reserve(PARAMS)  # the probe gets a share of the ladder
+    assert configs[0].time_limit_s == pytest.approx(solve_module.PROBE_SHARE * ladder)
 
 
 def test_static_orphans_are_the_classes_no_objective_term_rewards() -> None:
@@ -464,13 +473,16 @@ def _shelter_for_one() -> Problem:
     )
 
 
-@pytest.mark.parametrize("det", [None, 2.0], ids=["wall-clock", "deterministic"])
-@pytest.mark.parametrize("orphans", [False, True], ids=["no-static-orphans", "static-orphans"])
-def test_ladder_gives_up_the_reserve_only_for_static_orphans(
-    monkeypatch: pytest.MonkeyPatch, *, det: float | None, orphans: bool
-) -> None:
-    clock = _freeze(monkeypatch)
-    start = clock.now
+def _reserve(params: Params) -> float:
+    """Wall-clock reserve of the coverage step: min(10 s, 0.15 of the phase A budget)."""
+    budget = _phase_a_budget(params)
+    return min(solve_module.COVERAGE_MAX_S, solve_module.COVERAGE_SHARE * budget)
+
+
+def _ladder_spy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[list[SolverConfig], list[float | None]]:
+    """Config and ``deadline`` of every ladder run (the probe passes no deadline)."""
     real = phase_a.solve_phase_a
     configs: list[SolverConfig] = []
     deadlines: list[float | None] = []
@@ -483,7 +495,33 @@ def test_ladder_gives_up_the_reserve_only_for_static_orphans(
         return real(index, caps, config, *args, **kwargs)  # pyright: ignore[reportArgumentType]
 
     monkeypatch.setattr(solve_module, "solve_phase_a", spy)
-    coverage = _spy(monkeypatch)
+    return configs, deadlines
+
+
+def _coverage_configs(monkeypatch: pytest.MonkeyPatch) -> list[SolverConfig]:
+    """The config every coverage run was called with (positional argument 4)."""
+    real = phase_a.solve_coverage
+    configs: list[SolverConfig] = []
+
+    def spy(*args: object, **kwargs: object) -> PhaseAOutcome:
+        configs.append(cast("SolverConfig", args[4]))
+        return real(*args, **kwargs)  # pyright: ignore[reportArgumentType]
+
+    monkeypatch.setattr(solve_module, "solve_coverage", spy)
+    return configs
+
+
+@pytest.mark.parametrize("det", [None, 2.0], ids=["wall-clock", "deterministic"])
+@pytest.mark.parametrize("orphans", [False, True], ids=["no-static-orphans", "static-orphans"])
+def test_ladder_always_leaves_the_coverage_reserve(
+    monkeypatch: pytest.MonkeyPatch, *, det: float | None, orphans: bool
+) -> None:
+    # Classes the objective rewards can still be left without an in-person day by the plan the
+    # ladder finds ("dynamic orphans", _shelter_for_one): the reserve must not depend on that.
+    clock = _freeze(monkeypatch)
+    start = clock.now
+    configs, deadlines = _ladder_spy(monkeypatch)
+    coverage = _coverage_configs(monkeypatch)
     p = _orphans() if orphans else _shelter_for_one()
     params = replace(PARAMS, max_deterministic_time=det)
 
@@ -491,20 +529,63 @@ def test_ladder_gives_up_the_reserve_only_for_static_orphans(
 
     assert bool(static_orphans(build_index(p))) is orphans
     assert len(coverage) == 1  # a class without an in-person day: the step ran in every case
-    budget = _phase_a_budget(params)
+    budget, reserve = _phase_a_budget(params), _reserve(params)
     share, probe_share = solve_module.COVERAGE_SHARE, solve_module.PROBE_SHARE
-    probe = configs[0]
+    probe, follow_ups, step = configs[0], configs[1:], coverage[0]
     if det is None:  # wall clock: the reserve comes off the ladder's deadline
-        ladder = budget - share * budget if orphans else budget
+        ladder = budget - reserve
         assert probe.time_limit_s == pytest.approx(probe_share * ladder)
         assert probe.max_deterministic_time is None
+        assert step.time_limit_s == pytest.approx(reserve)  # the clock is frozen
+        assert step.max_deterministic_time is None
     else:  # det splits the work; the wall clock is the same safety net for ladder and step
         ladder = budget
+        ladder_det = det * (1 - share)
         assert probe.time_limit_s == pytest.approx(budget)
-        ladder_det = det - share * det if orphans else det
         assert probe.max_deterministic_time == pytest.approx(probe_share * ladder_det)
+        for c in follow_ups:
+            assert c.max_deterministic_time == pytest.approx((1 - probe_share) * ladder_det)
+        assert step.max_deterministic_time == pytest.approx(share * det)
+        planned = ladder_det + cast("float", step.max_deterministic_time)
+        assert planned <= det + 1e-9  # phase A never plans more work than it was given
     assert all(d == pytest.approx(start + ladder) for d in deadlines if d is not None)
     assert result.status in FOUND
+
+
+def test_coverage_runs_after_a_ladder_that_used_its_whole_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The large lyceum in miniature: no static orphan, the ladder runs to its deadline and a
+    # class is still without an in-person day. The step must still get its reserve.
+    clock = _freeze(monkeypatch)
+    start = clock.now
+    real = phase_a.solve_phase_a
+    ladder: list[PhaseAOutcome] = []
+
+    def to_its_deadline(
+        index: Index, caps: tuple[int, ...], config: SolverConfig, *args: object, **kwargs: object
+    ) -> PhaseAOutcome:
+        if not ladder:  # one real plan, reported FEASIBLE so that the follow-up runs too
+            outcome = real(index, caps, config, *args, **kwargs)  # pyright: ignore[reportArgumentType]
+            ladder.append(replace(outcome, info=replace(outcome.info, status=SolveStatus.FEASIBLE)))
+        deadline = cast("float | None", kwargs.get("deadline"))
+        clock.now = clock.now + config.time_limit_s if deadline is None else deadline
+        return ladder[0]
+
+    monkeypatch.setattr(solve_module, "solve_phase_a", to_its_deadline)
+    coverage = _coverage_configs(monkeypatch)
+    p = _shelter_for_one()
+
+    result = solve(p, PARAMS, progress=Progress(clock=clock))
+
+    assert static_orphans(build_index(p)) == []
+    assert len(ladder) == 1
+    assert len(coverage) == 1  # the step ran although the ladder used all of its time ...
+    assert clock.now == pytest.approx(start + _phase_a_budget(PARAMS) - _reserve(PARAMS))
+    # ... because the ladder's time ended a whole reserve before the phase A deadline.
+    assert coverage[0].time_limit_s == pytest.approx(_reserve(PARAMS))
+    assert result.status is SolveStatus.FEASIBLE
+    assert golden.violations(p, result) == []
 
 
 def test_coverage_skipped_when_phase_a_left_no_time(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -517,7 +598,7 @@ def test_coverage_skipped_when_phase_a_left_no_time(monkeypatch: pytest.MonkeyPa
         if not ladder:  # one real plan, reported FEASIBLE for every ladder run
             outcome = real(*args, **kwargs)  # pyright: ignore[reportArgumentType]
             ladder.append(replace(outcome, info=replace(outcome.info, status=SolveStatus.FEASIBLE)))
-        clock.now = deadline  # each run used the whole phase A budget
+        clock.now = deadline  # the ladder overran into the reserve: no time left for the step
         return ladder[0]
 
     monkeypatch.setattr(solve_module, "solve_phase_a", late)
@@ -533,3 +614,38 @@ def test_coverage_skipped_when_phase_a_left_no_time(monkeypatch: pytest.MonkeyPa
     assert golden.in_person_days(result) == kept
     assert result.status is SolveStatus.FEASIBLE
     assert golden.violations(p, result) == []
+
+
+_seconds = st.floats(0.0, 10_000.0, allow_nan=False)
+
+
+@given(
+    phase_a_s=_seconds,
+    elapsed=_seconds,
+    det=st.none() | st.floats(0.0, 1_000.0, allow_nan=False),
+)
+def test_coverage_budgets_split_phase_a_without_overrun(
+    phase_a_s: float, elapsed: float, det: float | None
+) -> None:
+    # Pure split: the ladder and the step together never get more than phase A was given.
+    now = 1000.0
+    deadline = now + phase_a_s - elapsed  # may already be past
+    params = replace(PARAMS, max_deterministic_time=det)
+    split = solve_module._coverage_budgets  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+    ladder, step = split(params, deadline, now)
+
+    assert step.deadline == deadline
+    if det is None:
+        assert step.det is None
+        assert ladder.det is None
+        assert step.max_s is not None
+        assert 0.0 <= step.max_s <= solve_module.COVERAGE_MAX_S
+        assert ladder.deadline + step.max_s == pytest.approx(deadline)
+        assert ladder.deadline <= deadline
+    else:
+        assert ladder.deadline == deadline  # the wall clock is only the safety net
+        assert ladder.det is not None
+        assert step.det is not None
+        assert ladder.det + step.det == pytest.approx(det)
+        assert step.det == pytest.approx(solve_module.COVERAGE_SHARE * det)

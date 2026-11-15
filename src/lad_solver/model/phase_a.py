@@ -95,7 +95,9 @@ def static_orphans(index: Index) -> list[str]:
     """Coverable classes whose in-person days no objective term rewards, known before any search.
 
     No flag (secondary) and ``m_c == 0`` (primary): no priority lesson, or no pupils to weigh it.
-    Phase A leaves their formats to chance (ADR 2026-11-14).
+    Phase A leaves their formats to chance (ADR 2026-11-14). Diagnostics and a test precondition
+    only: the coverage reserve no longer depends on it (addendum 2026-11-15), since a plan can
+    leave rewarded classes without an in-person day too.
     """
     return [
         index.problem.classes[c].id

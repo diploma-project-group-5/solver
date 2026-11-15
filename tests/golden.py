@@ -16,7 +16,7 @@ import subprocess
 from dataclasses import dataclass
 from functools import cache
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 
 from lad_solver.cli.io import problem_to_json
 from lad_solver.domain.problem import Problem
@@ -55,11 +55,30 @@ def violations(problem: Problem, result: Result) -> list[str]:
     status = outcome["status"]
     if status == "INVALID_INPUT":
         return [f"validator-lib INVALID_INPUT: {json.dumps(outcome.get('issues'))}"]
-    conflicts = cast("list[Json]", outcome["conflicts"])
-    lines = [json.dumps(c, sort_keys=True) for c in conflicts]
+    lines = [json.dumps(c, sort_keys=True) for c in conflicts(problem, result)]
     if status != "ACCEPTED" and not lines:
         return [f"validator-lib {status} without conflicts"]
     return lines
+
+
+def conflicts(problem: Problem, result: Result) -> list[Json]:
+    """The raw conflicts (conflict.v1) validator-lib reports for the timetable."""
+    outcome = _outcome(problem, result)
+    if "conflicts" not in outcome:
+        msg = f"validator-lib returned no conflicts list ({outcome['status']})"
+        raise AssertionError(msg)
+    return cast("list[Json]", outcome["conflicts"])
+
+
+def capacity_conflicts(
+    problem: Problem, result: Result, condition: Literal["seats", "passport"]
+) -> list[Json]:
+    """``capacity_exceeded`` conflicts of one 1.2 condition (a filter, not a rule in Python)."""
+    return [
+        c
+        for c in conflicts(problem, result)
+        if c.get("rule") == "capacity_exceeded" and c.get("condition") == condition
+    ]
 
 
 def day_load(problem: Problem, result: Result, day: int) -> DayLoad:
