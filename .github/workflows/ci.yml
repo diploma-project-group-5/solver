@@ -71,9 +71,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7, resolved 2026-11-08
         with:
           repository: diploma-project-group-5/contracts
-          # Commit 0d2a731 of contracts branch feat/72-unsupported-job-type (0.4.0, unsupported_job_type);
-          # repinned to tag v0.4.0 once that branch is merged.
-          ref: 0d2a731a6252d9d2227ef19174d293c5ca90be5e
+          ref: 32ce02c5ddd8ecc61caba8f3c2a5bcc0a0f30bd8  # tag v0.4.0
           path: _contracts
           persist-credentials: false
 
