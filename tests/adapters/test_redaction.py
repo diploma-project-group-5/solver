@@ -8,7 +8,19 @@ import json
 from typing import Any
 
 import pytest
-from kafka_support import FakeEngine, Journal, Json, build_request, encode, harness, with_data
+from kafka_support import (
+    SUBSTITUTION_DLQ_TOPIC,
+    SUBSTITUTION_TOPIC,
+    FakeEngine,
+    Journal,
+    Json,
+    build_request,
+    encode,
+    harness,
+    inbound,
+    substitution_request,
+    with_data,
+)
 from pydantic import ValidationError
 
 from lad_solver.adapters.kafka.payload import BuildRequested
@@ -74,11 +86,41 @@ CASES: dict[str, Json] = {
 }
 
 
-@pytest.mark.parametrize("case", sorted(CASES))
+def _substitution_with_personal_data(document: Json) -> Json:
+    def add(data: Json) -> None:
+        data["absent_teacher_id"] = MARKER  # a signature typed into the absent teacher's id
+        data["absent_teacher_name"] = MARKER
+        data["lessons"][0]["teacher_signature"] = MARKER
+
+    changed = with_data(document, add)
+    changed["source"] = MARKER
+    return changed
+
+
+def _other_major(document: Json) -> Json:
+    changed = dict(document)
+    changed["schema_version"] = "2.0"
+    changed["type"] = MARKER  # free text where the contract has a constant
+    return changed
+
+
+SUBSTITUTION_CASES: dict[str, Json] = {
+    "substitution-unsupported": _substitution_with_personal_data(substitution_request()),
+    "substitution-rejected": _other_major(_substitution_with_personal_data(substitution_request())),
+    "substitution-poison": with_data(
+        _substitution_with_personal_data(substitution_request()), _no_job_id
+    ),
+}
+
+
+@pytest.mark.parametrize("case", sorted(CASES | SUBSTITUTION_CASES))
 def test_marker_never_leaves_the_worker(case: str, capsys: pytest.CaptureFixture[str]) -> None:
     h = harness()
-
-    assert h.run(encode(CASES[case])) == 0
+    if case in SUBSTITUTION_CASES:
+        delivered = inbound(encode(SUBSTITUTION_CASES[case]), topic=SUBSTITUTION_TOPIC)
+        assert h.run(delivered) == 0
+    else:
+        assert h.run(encode(CASES[case])) == 0
 
     out, err = capsys.readouterr()
     assert MARKER not in out
@@ -86,6 +128,8 @@ def test_marker_never_leaves_the_worker(case: str, capsys: pytest.CaptureFixture
     assert h.producer.sent, "every case produces at least one message"
     if case.startswith(("rejected", "poison")):
         assert h.producer.dlq(), "the redacted DLQ copy is still produced"
+    if case.startswith(("substitution-rejected", "substitution-poison")):
+        assert h.producer.dlq(SUBSTITUTION_DLQ_TOPIC), "the redacted DLQ copy is still produced"
     for message in h.producer.sent:
         assert MARKER.encode() not in (message.value or b"")
         assert ESCAPED not in (message.value or b"")

@@ -6,26 +6,34 @@ from typing import Any
 from uuid import UUID
 
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 from kafka_support import (
     JOB_ID,
     NOW,
     SCHOOL_ID,
+    SUBSTITUTION_DLQ_TOPIC,
+    SUBSTITUTION_TOPIC,
     Json,
     build_request,
     encode,
     feasible_result,
     inbound,
+    substitution_request,
     with_data,
 )
 
 from lad_solver.adapters.kafka.config import ConfigError, WorkerConfig
 from lad_solver.adapters.kafka.mapping import (
+    BUILD_DLQ_MODELS,
+    SUBSTITUTION_DLQ_MODELS,
     Accepted,
     Address,
     ErrorCode,
     Poison,
     Provenance,
     Rejected,
+    Unsupported,
     address_of,
     completed_data,
     completed_message,
@@ -33,6 +41,8 @@ from lad_solver.adapters.kafka.mapping import (
     event_id,
     params_for,
     parse_build_request,
+    parse_substitution_request,
+    rejected_data,
 )
 from lad_solver.domain.problem import (
     AlertLimits,
@@ -219,7 +229,9 @@ def test_dlq_copy_keeps_contract_fields_and_drops_unknown_ones() -> None:
     )
     document["data"]["classes"] = "not-a-list"
 
-    copy = dlq_message(inbound(encode(document)), topic="dlq", error_class="validation")
+    copy = dlq_message(
+        inbound(encode(document)), topic="dlq", error_class="validation", models=BUILD_DLQ_MODELS
+    )
 
     projected = json.loads(copy.value or b"")["projected"]
     assert projected["data"]["teachers"][0] == {
@@ -461,7 +473,9 @@ def test_integer_over_4300_digits_is_rejected_not_poison() -> None:
 
 
 def test_integer_over_4300_digits_is_projected_in_the_dlq() -> None:
-    copy = dlq_message(inbound(_huge_staff()), topic="dlq", error_class="validation")
+    copy = dlq_message(
+        inbound(_huge_staff()), topic="dlq", error_class="validation", models=BUILD_DLQ_MODELS
+    )
 
     value = copy.value or b""
     assert MARKER.encode() not in value
@@ -472,7 +486,9 @@ def test_integer_over_4300_digits_is_projected_in_the_dlq() -> None:
 def test_oversized_dlq_projection_falls_back_to_the_envelope_head() -> None:
     document = with_data(build_request(), lambda d: d.update(classes=[1] * 300_000))
 
-    copy = dlq_message(inbound(encode(document)), topic="dlq", error_class="validation")
+    copy = dlq_message(
+        inbound(encode(document)), topic="dlq", error_class="validation", models=BUILD_DLQ_MODELS
+    )
 
     value = copy.value or b""
     assert len(value) < 512 * 1024
@@ -488,8 +504,172 @@ def test_non_finite_numbers_are_redacted_in_the_dlq(literal: bytes) -> None:
     raw = encode(build_request()).replace(b'"staff": 4', b'"staff": ' + literal)
     raw = raw.replace(b'"unavailable_days": [3]', b'"unavailable_days": [3, ' + literal + b"]")
 
-    copy = dlq_message(inbound(raw), topic="dlq", error_class="validation")
+    copy = dlq_message(inbound(raw), topic="dlq", error_class="validation", models=BUILD_DLQ_MODELS)
 
     loaded = json.loads(copy.value or b"")  # strict JSON: no NaN / Infinity tokens left
     assert loaded["projected"]["data"]["staff"] == "<redacted:float>"
     assert loaded["projected"]["data"]["teachers"][1]["unavailable_days"] == "<redacted:list>"
+
+
+# ---------------------------------------------------------------- substitutions (stage 1)
+# Until the stage 2 engine the solver reads only the envelope and data.job_id of a substitution
+# job and answers it with MODEL_INVALID / unsupported_job_type (ADR 2026-11-15).
+
+
+def test_substitution_request_is_unsupported_until_stage2_engine() -> None:
+    assert parse_substitution_request(encode(substitution_request())) == Unsupported(ADDRESS)
+
+
+def test_substitution_without_job_id_is_poison_until_stage2_engine() -> None:
+    document = with_data(substitution_request(), lambda d: d.pop("job_id"))
+
+    assert parse_substitution_request(encode(document)) == Poison("invalid_envelope")
+
+
+@pytest.mark.parametrize(("raw", "error_class"), [(b"{", "not_json"), (b"[]", "not_json_object")])
+def test_unparseable_substitution_is_poison_until_stage2_engine(
+    raw: bytes, error_class: str
+) -> None:
+    assert parse_substitution_request(raw) == Poison(error_class)
+
+
+def test_foreign_type_on_the_substitution_topic_is_rejected_until_stage2_engine() -> None:
+    document = substitution_request()
+    document["type"] = "solve.build.requested"
+
+    outcome = parse_substitution_request(encode(document))
+
+    assert outcome == Rejected(ADDRESS, ErrorCode.INVALID_PAYLOAD, "unexpected_type")
+
+
+def test_substitution_type_on_the_build_topic_is_still_rejected() -> None:
+    outcome = parse_build_request(encode(substitution_request()))
+
+    assert outcome == Rejected(ADDRESS, ErrorCode.INVALID_PAYLOAD, "unexpected_type")
+
+
+@pytest.mark.parametrize("version", ["2", "2.0", "0.9"])
+def test_substitution_with_other_major_is_unsupported_schema_until_stage2_engine(
+    version: str,
+) -> None:
+    document = substitution_request()
+    document["schema_version"] = version
+
+    outcome = parse_substitution_request(encode(document))
+
+    assert outcome == Rejected(ADDRESS, ErrorCode.UNSUPPORTED_SCHEMA_VERSION, "schema_version")
+
+
+@pytest.mark.parametrize("case", sorted(set(ENVELOPE_ERRORS) - {"no-data"}))
+def test_substitution_envelope_errors_are_rejected_until_stage2_engine(case: str) -> None:
+    document = substitution_request()
+    ENVELOPE_ERRORS[case](document)
+
+    outcome = parse_substitution_request(encode(document))
+
+    assert isinstance(outcome, Rejected)
+    assert outcome.code is ErrorCode.INVALID_PAYLOAD
+    assert outcome.address == ADDRESS
+
+
+@pytest.mark.parametrize(
+    ("field", "value"), [("time", "yesterday"), ("source", 123), ("source", [])]
+)
+def test_substitution_with_a_malformed_time_or_source_is_rejected_until_stage2_engine(
+    field: str, value: object
+) -> None:
+    document = substitution_request()
+    document[field] = value
+
+    outcome = parse_substitution_request(encode(document))
+
+    assert outcome == Rejected(ADDRESS, ErrorCode.INVALID_PAYLOAD, "validation")
+
+
+@pytest.mark.parametrize("field", ["time", "source"])
+def test_substitution_without_time_or_source_is_unsupported_until_stage2_engine(
+    field: str,
+) -> None:
+    document = substitution_request()
+    document.pop(field)
+
+    assert parse_substitution_request(encode(document)) == Unsupported(ADDRESS)
+
+
+_JSON_SCALARS = (
+    st.none()
+    | st.booleans()
+    | st.integers(min_value=-(2**70), max_value=2**70)
+    | st.floats(allow_nan=False, allow_infinity=False)
+    | st.text(alphabet=st.characters(exclude_categories=("Cs",)), max_size=12)
+)
+_JSON = st.recursive(
+    _JSON_SCALARS,
+    lambda inner: st.lists(inner, max_size=4) | st.dictionaries(st.text(max_size=8), inner),
+    max_leaves=20,
+)
+
+
+@given(data=st.dictionaries(st.text(max_size=16), _JSON, max_size=8))
+def test_any_substitution_data_with_a_job_id_is_unsupported_until_stage2_engine(
+    data: Json,
+) -> None:
+    """The draft payload is never parsed: whatever stage 2 adds, the job is still answered."""
+    document = substitution_request()
+    document["data"] = data | {"job_id": JOB_ID}
+
+    assert parse_substitution_request(encode(document)) == Unsupported(ADDRESS)
+
+
+def test_unsupported_job_type_carries_no_conflicts() -> None:
+    data = rejected_data(UUID(JOB_ID), ErrorCode.UNSUPPORTED_JOB_TYPE)
+
+    assert data == {
+        "job_id": JOB_ID,
+        "status": "MODEL_INVALID",
+        "lessons": [],
+        "day_formats": [],
+        "conflicts": [],
+        "error": {"code": "unsupported_job_type"},
+    }
+
+
+@pytest.mark.parametrize(
+    ("code", "conflicts"),
+    [
+        (ErrorCode.INVALID_PAYLOAD, [{"rule": "invalid_input"}]),
+        (ErrorCode.UNSUPPORTED_SCHEMA_VERSION, [{"rule": "invalid_input"}]),
+        (ErrorCode.RESULT_TOO_LARGE, []),
+        (ErrorCode.INTERNAL, []),
+        (ErrorCode.UNSUPPORTED_JOB_TYPE, []),
+    ],
+)
+def test_only_input_errors_name_the_invalid_input_rule(
+    code: ErrorCode, conflicts: list[Json]
+) -> None:
+    assert rejected_data(UUID(JOB_ID), code)["conflicts"] == conflicts
+
+
+def test_substitution_dlq_copy_keeps_only_the_envelope_and_job_id() -> None:
+    document = substitution_request()
+    document["type"] = "Петренко Олена is absent"  # free text where the contract has a constant
+    document["source"] = "Петренко Олена"
+
+    copy = dlq_message(
+        inbound(encode(document), topic=SUBSTITUTION_TOPIC),
+        topic=SUBSTITUTION_DLQ_TOPIC,
+        error_class="unexpected_type",
+        models=SUBSTITUTION_DLQ_MODELS,
+    )
+
+    value = copy.value or b""
+    projected = json.loads(value)["projected"]
+    assert projected["data"] == {"job_id": JOB_ID}
+    assert projected["type"] == "<redacted:str>"
+    assert projected["source"] == "<redacted:str>"
+    assert projected["school_id"] == SCHOOL_ID
+    assert projected["correlation_id"] == "req-5f2c9a"
+    for leaked in (b"absent_teacher_id", b"teachers", b"lessons", b"absence_dates", b"t-1"):
+        assert leaked not in value
+    assert copy.topic == SUBSTITUTION_DLQ_TOPIC
+    assert dict(copy.headers)["x-original-topic"] == SUBSTITUTION_TOPIC.encode()

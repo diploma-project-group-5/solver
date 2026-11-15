@@ -8,7 +8,7 @@ import hashlib
 import json
 import math
 import re
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -29,6 +29,7 @@ from lad_solver.adapters.kafka.payload import (
     BuildRequestedData,
     EnvelopeHead,
     Id,
+    SubstitutionHead,
 )
 from lad_solver.adapters.kafka.ports import InboundMessage, OutboundMessage
 from lad_solver.domain.problem import (
@@ -45,6 +46,7 @@ from lad_solver.domain.problem import (
 from lad_solver.domain.result import Result, SolveStatus
 
 BUILD_REQUESTED: Final = "solve.build.requested"
+SUBSTITUTION_REQUESTED: Final = "solve.substitution.requested"
 STARTED: Final = "solve.started"
 COMPLETED: Final = "solve.completed"
 SCHEMA_VERSION: Final = "1.0"
@@ -64,6 +66,12 @@ class ErrorCode(StrEnum):
     UNSUPPORTED_SCHEMA_VERSION = "unsupported_schema_version"
     RESULT_TOO_LARGE = "result_too_large"
     INTERNAL = "internal"
+    # The solver cannot run this kind of job yet: substitutions until stage 2 (ADR 2026-11-15).
+    UNSUPPORTED_JOB_TYPE = "unsupported_job_type"
+
+
+# Errors caused by the request itself: the answer names the invalid_input rule in conflicts.
+_INPUT_ERRORS: Final = frozenset({ErrorCode.INVALID_PAYLOAD, ErrorCode.UNSUPPORTED_SCHEMA_VERSION})
 
 
 class InvalidInputError(ValueError):
@@ -100,6 +108,13 @@ class Rejected:
 
 
 @dataclass(frozen=True, slots=True)
+class Unsupported:
+    """A well-formed job the solver cannot run yet: MODEL_INVALID / unsupported_job_type, no DLQ."""
+
+    address: Address
+
+
+@dataclass(frozen=True, slots=True)
 class Accepted:
     address: Address
     data: BuildRequestedData
@@ -112,7 +127,7 @@ class Accepted:
         return self.data.queue_deadline_at
 
 
-type ParseOutcome = Poison | Rejected | Accepted
+type ParseOutcome = Poison | Rejected | Unsupported | Accepted
 
 
 def event_id(job_id: UUID, event_type: str) -> UUID:
@@ -179,7 +194,9 @@ def address_of(raw: bytes | None) -> Address | None:
         return None
 
 
-def _envelope_rejection(document: dict[str, object]) -> tuple[ErrorCode, str] | None:
+def _envelope_rejection(
+    document: dict[str, object], expected_type: str
+) -> tuple[ErrorCode, str] | None:
     version = document.get("schema_version")
     if not isinstance(version, str) or _SCHEMA_VERSION.fullmatch(version) is None:
         return ErrorCode.INVALID_PAYLOAD, "schema_version"
@@ -190,7 +207,7 @@ def _envelope_rejection(document: dict[str, object]) -> tuple[ErrorCode, str] | 
         head = EnvelopeHead.model_validate(document)
     except ValidationError:
         return ErrorCode.INVALID_PAYLOAD, "invalid_envelope"
-    if head.type != BUILD_REQUESTED:
+    if head.type != expected_type:
         return ErrorCode.INVALID_PAYLOAD, "unexpected_type"
     return None
 
@@ -207,7 +224,7 @@ def parse_build_request(raw: bytes | None) -> ParseOutcome:
     address = _address(document)
     if address is None:
         return Poison("invalid_envelope")
-    rejection = _envelope_rejection(document)
+    rejection = _envelope_rejection(document, BUILD_REQUESTED)
     if rejection is None:
         try:
             event = BuildRequested.model_validate(document)
@@ -222,6 +239,29 @@ def parse_build_request(raw: bytes | None) -> ParseOutcome:
         else:
             return Accepted(address, event.data, problem, digest, event.time)
     return Rejected(address, *rejection)
+
+
+def parse_substitution_request(raw: bytes | None) -> Poison | Rejected | Unsupported:
+    """Classify a substitution job until the stage 2 engine (ADR 2026-11-15).
+
+    Only the envelope and ``data.job_id`` are read: the draft payload is never validated, so any
+    well-formed job is Unsupported, whatever stage 2 adds to ``data``. A broken envelope is
+    answered (Rejected) or, without an address, Poison — as for a build job.
+    """
+    document = _load(raw)
+    if isinstance(document, Poison):
+        return document
+    address = _address(document)
+    if address is None:
+        return Poison("invalid_envelope")
+    rejection = _envelope_rejection(document, SUBSTITUTION_REQUESTED)
+    if rejection is not None:
+        return Rejected(address, *rejection)
+    try:
+        SubstitutionHead.model_validate(document)  # only time/source are left to fail here
+    except ValidationError:
+        return Rejected(address, ErrorCode.INVALID_PAYLOAD, "validation")
+    return Unsupported(address)
 
 
 def _unique(kind: str, ids: list[str]) -> set[str]:
@@ -408,7 +448,7 @@ def completed_data(
 
 def rejected_data(job_id: UUID, code: ErrorCode) -> dict[str, object]:
     data = completed_data(job_id, Result(status=SolveStatus.MODEL_INVALID), None)
-    data["conflicts"] = [{"rule": "invalid_input"}] if code is not ErrorCode.INTERNAL else []
+    data["conflicts"] = [{"rule": "invalid_input"}] if code in _INPUT_ERRORS else []
     data["error"] = {"code": code.value}
     return data
 
@@ -435,7 +475,6 @@ def completed_message(
     code = ErrorCode(error["code"]) if isinstance(error, dict) else None
     if len(value) > max_bytes:
         too_large = rejected_data(address.job_id, ErrorCode.RESULT_TOO_LARGE)
-        too_large["conflicts"] = []
         value = _envelope(address, COMPLETED, too_large, now)
         status, code = SolveStatus.MODEL_INVALID.value, ErrorCode.RESULT_TOO_LARGE
     return Completed(OutboundMessage(topic, address.key, value), status, code)
@@ -488,7 +527,7 @@ def _annotated(model: type[BaseModel], name: str) -> object:
     return Annotated[info.annotation, *info.metadata] if info.metadata else info.annotation
 
 
-# Free-text envelope fields of BuildRequested are checked as strictly as the envelope reader does;
+# Free-text envelope fields of inbound events are checked as strictly as the envelope reader does;
 # ``source`` has no contract format, so it is kept only when it looks like an identifier.
 _ENVELOPE_LEAVES: Final[dict[str, object]] = {
     "schema_version": _annotated(EnvelopeHead, "schema_version"),
@@ -497,9 +536,16 @@ _ENVELOPE_LEAVES: Final[dict[str, object]] = {
 }
 
 
+_ENVELOPE_MODELS: Final = frozenset({BuildRequested, SubstitutionHead})
+
+# DLQ projections per consumed topic: a field outside these models never reaches the DLQ copy.
+BUILD_DLQ_MODELS: Final[tuple[type[BaseModel], ...]] = (BuildRequested,)
+SUBSTITUTION_DLQ_MODELS: Final[tuple[type[BaseModel], ...]] = (SubstitutionHead,)
+
+
 @cache
 def _leaf_adapter(model: type[BaseModel], name: str) -> TypeAdapter[Any]:
-    override = _ENVELOPE_LEAVES.get(name) if model is BuildRequested else None
+    override = _ENVELOPE_LEAVES.get(name) if model in _ENVELOPE_MODELS else None
     annotation: Any = override or _annotated(model, name)  # a type form built at runtime
     return TypeAdapter[Any](annotation, config=_LEAF_CONFIG)
 
@@ -568,7 +614,7 @@ def _dump(document: dict[str, object]) -> bytes:
     return json.dumps(document, ensure_ascii=True, separators=(",", ":"), allow_nan=False).encode()
 
 
-def dlq_value(raw: bytes | None) -> bytes | None:
+def dlq_value(raw: bytes | None, models: Sequence[type[BaseModel]]) -> bytes | None:
     """DLQ copy for diagnostics. JSON is projected onto the contract's fields, so personal data
     added by mistake does not live on in the DLQ for 14 days. Bytes that are not JSON (truncated,
     wrong encoding) cannot be projected, so only their size and SHA-256 are kept."""
@@ -580,18 +626,24 @@ def dlq_value(raw: bytes | None) -> bytes | None:
         return _dump(
             {"unparseable": True, "size_bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
         )
-    projected = _project(document, [BuildRequested])
+    projected = _project(document, list(models))
     value = _dump({"projected": projected})
     if len(value) > MAX_DLQ_PROJECTION_BYTES:
         value = _dump({"projected": _minimal(projected), "truncated": True})
     return value
 
 
-def dlq_message(message: InboundMessage, *, topic: str, error_class: str) -> OutboundMessage:
+def dlq_message(
+    message: InboundMessage,
+    *,
+    topic: str,
+    error_class: str,
+    models: Sequence[type[BaseModel]],
+) -> OutboundMessage:
     headers = (
         ("x-error-class", error_class.encode()),
         ("x-original-topic", message.topic.encode()),
         ("x-original-partition", str(message.partition).encode()),
         ("x-original-offset", str(message.offset).encode()),
     )
-    return OutboundMessage(topic, message.key, dlq_value(message.value), headers)
+    return OutboundMessage(topic, message.key, dlq_value(message.value, models), headers)
