@@ -35,11 +35,12 @@ from referencing import Registry, Resource
 import golden
 from builders import OTHER, subjects
 from lad_solver.adapters.kafka.mapping import (
+    MAX_PROPOSALS,
     SUBSTITUTION_DLQ_MODELS,
     Address,
     ErrorCode,
     Provenance,
-    Unsupported,
+    Rejected,
     completed_data,
     completed_message,
     dlq_value,
@@ -47,6 +48,7 @@ from lad_solver.adapters.kafka.mapping import (
     rejected_data,
     started_message,
 )
+from lad_solver.adapters.kafka.payload import SubstitutionRequested
 from lad_solver.domain.problem import (
     AlertLimits,
     CurriculumRow,
@@ -168,7 +170,6 @@ def test_started_event_conforms() -> None:
         completed_data(UUID(JOB_ID), Result(status=SolveStatus.EXPIRED), None),
         rejected_data(UUID(JOB_ID), ErrorCode.INVALID_PAYLOAD),
         rejected_data(UUID(JOB_ID), ErrorCode.INTERNAL),
-        rejected_data(UUID(JOB_ID), ErrorCode.UNSUPPORTED_JOB_TYPE),
         completed_data(
             UUID(JOB_ID),
             Result(
@@ -192,7 +193,6 @@ def test_started_event_conforms() -> None:
         "expired",
         "invalid_payload",
         "internal",
-        "unsupported_job_type",
         "precheck-invalid-input",
         "engine-model-invalid",
     ],
@@ -243,20 +243,34 @@ def test_every_event_the_worker_publishes_conforms() -> None:
 
 
 def test_error_codes_match_the_schema_enum() -> None:
+    """unsupported_job_type stays in the contract for solvers before 0.4.0 and future job types
+    (ADR 2026-11-15); this solver answers every substitution job, so it never sends it."""
     completed = _load(SCHEMAS / "solve.status.v1.json")["$defs"]["completed"]
     enum = completed["properties"]["error"]["properties"]["code"]["enum"]
 
-    assert {code.value for code in ErrorCode} == set(enum)
+    assert {code.value for code in ErrorCode} == set(enum) - {"unsupported_job_type"}
 
 
-def test_substitution_answer_conforms_until_stage2_engine() -> None:
+def test_test_fixture_substitution_request_conforms() -> None:
+    assert _errors("solve.substitution.requested.v1.json", substitution_request()) == []
+
+
+def test_substitution_events_conform() -> None:
     h = harness()
 
     h.run(inbound(encode(substitution_request()), topic=SUBSTITUTION_TOPIC))
 
-    [event] = [decode(m) for m in h.producer.sent]
-    assert event["data"]["error"] == {"code": "unsupported_job_type"}
-    assert _errors("solve.status.v1.json", event) == []
+    started, completed = [decode(m) for m in h.producer.sent]
+    assert (started["type"], completed["type"]) == ("solve.started", "solve.completed")
+    assert completed["data"]["substitution"]["proposals"]
+    for event in (started, completed):
+        assert _errors("solve.status.v1.json", event) == []
+
+
+def test_substitution_result_bound_matches_the_schema() -> None:
+    substitution = _load(SCHEMAS / "solve.status.v1.json")["$defs"]["substitution"]
+
+    assert substitution["properties"]["proposals"]["maxItems"] == MAX_PROPOSALS
 
 
 # Largest result the request schema allows: every class x school day x lesson slot holds one lesson
@@ -373,16 +387,22 @@ def test_error_is_only_allowed_with_model_invalid() -> None:
     assert _errors("solve.status.v1.json", event) != []
 
 
-def test_contract_substitution_example_is_unsupported_until_stage2_engine() -> None:
-    """The producer's real shape (contracts example), not only the test fixture."""
+def test_contract_substitution_example_passes_the_schema_stage() -> None:
+    """The producer's real shape (contracts example) is read by the payload models.
+
+    The example is an illustration, not one consistent week: its template lists Wednesday only
+    while its approved substitutions sit on Tuesday slots, so the engine refuses it as an
+    inconsistent week (referential_integrity), as timetable's week builder would.
+    """
     [path] = sorted((CONTRACTS / "examples" / "solve.substitution.requested.v1").glob("*.json"))
     raw = path.read_bytes()
     job_id = _load(path)["data"]["job_id"]
+    SubstitutionRequested.model_validate(_load(path))  # the whole payload, no error
 
     outcome = parse_substitution_request(raw)
 
-    assert isinstance(outcome, Unsupported)
-    assert str(outcome.address.job_id) == job_id
+    assert isinstance(outcome, Rejected)
+    assert (str(outcome.address.job_id), outcome.error_class) == (job_id, "referential_integrity")
     projected = json.loads(dlq_value(raw, SUBSTITUTION_DLQ_MODELS) or b"")["projected"]
     assert projected["data"] == {"job_id": job_id}
 

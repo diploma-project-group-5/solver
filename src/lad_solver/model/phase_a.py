@@ -14,8 +14,8 @@ from dataclasses import dataclass, field
 
 from ortools.sat.python import cp_model
 
-from lad_solver.domain.problem import AlertLimits
 from lad_solver.domain.result import SolveStatus
+from lad_solver.model.capacity import add_day_capacity, day_room
 from lad_solver.model.cpsat import RunInfo, SolverConfig, run
 from lad_solver.model.index import Index
 from lad_solver.model.progress import Progress
@@ -262,22 +262,20 @@ def _pair_has_lessons(
 
 
 def _add_capacity(m: PhaseAModel, index: Index) -> None:
-    """Per day: students (+ staff + teachers on site) within the limits.
+    """Per day: students (+ staff + teachers on site) within the limits (``model/capacity``).
 
-    The right-hand sides are clamped to what a day can hold at most, so that limits beyond
-    int64 (CP-SAT constants) mean "unlimited" instead of crashing the model build. Staff moves
-    to the right-hand side: ``passport - staff`` is exact in Python and >= 0 after pre-checks.
+    ``passport - staff`` is >= 0 after pre-checks.
     """
-    capacity = index.problem.capacity
-    total_pupils = sum(index.students)
-    free = min(capacity.passport - index.problem.staff, total_pupils + len(index.problem.teachers))
-    seats = min(capacity.seats, total_pupils) if isinstance(capacity, AlertLimits) else None
+    room = day_room(
+        index.problem.capacity,
+        index.problem.staff,
+        max_pupils=sum(index.students),
+        max_teachers=len(index.problem.teachers),
+    )
     for d in index.days:
         students = sum(index.students[c] * f for (c, day), f in m.f.items() if day == d)
         teachers = sum(z for (_, day), z in m.z.items() if day == d)
-        if seats is not None:
-            m.model.add(students <= seats).with_name(f"seats_{d}")
-        m.model.add(students + teachers <= free).with_name(f"passport_{d}")
+        add_day_capacity(m.model, d, students, teachers, room)
 
 
 def _add_outside_shelter(m: PhaseAModel, index: Index, caps: tuple[int, ...]) -> None:

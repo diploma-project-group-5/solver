@@ -7,7 +7,7 @@ import time
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +19,7 @@ from lad_solver.adapters.kafka.ports import (
     TransientKafkaError,
 )
 from lad_solver.adapters.kafka.worker import Worker
+from lad_solver.app.substitute import substitute
 from lad_solver.domain.problem import Params, Problem
 from lad_solver.domain.result import (
     Conflict,
@@ -29,6 +30,11 @@ from lad_solver.domain.result import (
     SolveStatus,
     Stats,
     StopReason,
+)
+from lad_solver.domain.substitution import (
+    SubstitutionParams,
+    SubstitutionRequest,
+    SubstitutionResult,
 )
 from lad_solver.model.progress import Progress
 from lad_solver.model.stop import StopHandle
@@ -89,8 +95,27 @@ def build_request(**data_overrides: object) -> Json:
     }
 
 
+def _week_lessons() -> list[Json]:
+    """Every school day: c-5a L1 PE (t-2), L2 maths (t-1); c-9b L1 maths (t-1), L3 PE (t-2)."""
+    return [
+        {"class_id": c, "day": d, "lesson_no": n, "subject_id": s, "teacher_id": t}
+        for d in (1, 2, 3, 4, 5)
+        for c, n, s, t in (
+            ("c-5a", 1, "s-pe", "t-2"),
+            ("c-5a", 2, "s-math", "t-1"),
+            ("c-9b", 1, "s-math", "t-1"),
+            ("c-9b", 3, "s-pe", "t-2"),
+        )
+    ]
+
+
 def substitution_request(**data_overrides: object) -> Json:
-    """A solve.substitution.requested envelope (stage 2 draft): who is absent and which lessons."""
+    """A valid solve.substitution.requested envelope (contracts 0.5.0), ISO week 2026-W46.
+
+    t-1 (maths) is absent on Wednesday 2026-11-11 and Thursday; the job covers c-5a L2 on
+    Wednesday. t-2 (PE only) works that day and is free in L2: the engine proposes him at
+    step 1, "не за фахом".
+    """
     data: Json = {
         "job_id": JOB_ID,
         "snapshot_version": 42,
@@ -102,7 +127,38 @@ def substitution_request(**data_overrides: object) -> Json:
         "lessons": [{"class_id": "c-5a", "lesson_no": 2}],
         "not_before": "2026-11-10",
         "iso_week": "2026-W46",
-        "teachers": [{"id": "t-1", "weekly_limit": 20, "unavailable_days": []}],
+        "school_days": [1, 2, 3, 4, 5],
+        "lessons_per_day": 6,
+        "staff": 4,
+        "capacity": {"passport": 60},
+        "classes": [
+            {"id": "c-5a", "students": 28, "priority": True},
+            {"id": "c-9b", "students": 24, "priority": False},
+        ],
+        "subjects": [
+            {"id": "s-math", "priority_area": True, "no_shelter": False},
+            {"id": "s-pe", "priority_area": False, "no_shelter": True},
+        ],
+        "teachers": [
+            {"id": "t-1", "weekly_limit": 20, "unavailable_days": []},
+            {"id": "t-2", "weekly_limit": 18, "unavailable_days": []},
+        ],
+        "rows": [
+            {"class_id": "c-5a", "subject_id": "s-math", "teacher_id": "t-1", "hours": 5},
+            {"class_id": "c-5a", "subject_id": "s-pe", "teacher_id": "t-2", "hours": 5},
+            {"class_id": "c-9b", "subject_id": "s-math", "teacher_id": "t-1", "hours": 5},
+            {"class_id": "c-9b", "subject_id": "s-pe", "teacher_id": "t-2", "hours": 5},
+        ],
+        "template": {
+            "timetable_id": "9d8c7b6a-5f4e-4d3c-8b2a-1f0e9d8c7b6a",
+            "kind": "main",
+            "lessons": _week_lessons(),
+            "day_formats": [
+                {"class_id": c, "day": d, "in_person": True}
+                for c in ("c-5a", "c-9b")
+                for d in (1, 2, 3, 4, 5)
+            ],
+        },
         "approved_substitutions": [],
     }
     data.update(data_overrides)
@@ -289,6 +345,34 @@ class FakeEngine:
         return self.result
 
 
+@dataclass
+class FakeSubstitution:
+    """Records calls; runs the real engine unless ``result`` or ``error`` is given."""
+
+    journal: Journal
+    result: SubstitutionResult | None = None
+    error: Exception | None = None
+    wait_for_stop: bool = False
+    calls: list[tuple[SubstitutionRequest, SubstitutionParams]] = field(
+        default_factory=list[tuple[SubstitutionRequest, SubstitutionParams]]
+    )
+    stop_seen: bool = False
+
+    def __call__(
+        self, request: SubstitutionRequest, params: SubstitutionParams, stop: StopHandle
+    ) -> SubstitutionResult:
+        self.calls.append((request, params))
+        self.journal.entries.append("substitute")
+        if self.wait_for_stop:
+            deadline = time.monotonic() + 10
+            while not stop.stopped and time.monotonic() < deadline:
+                time.sleep(0.005)
+            self.stop_seen = stop.stopped
+        if self.error is not None:
+            raise self.error
+        return self.result or substitute(request, params, stop)
+
+
 def config(**overrides: Any) -> WorkerConfig:  # noqa: ANN401 -- forwarded to the dataclass
     values: dict[str, Any] = {
         "bootstrap_servers": "fake:9092",
@@ -310,6 +394,7 @@ class Harness:
     consumer: FakeConsumer
     producer: FakeProducer
     engine: FakeEngine
+    substitution: FakeSubstitution
     journal: Journal
     sleeps: list[float]
     exits: list[int]
@@ -326,6 +411,7 @@ class Harness:
 def harness(
     *,
     engine: FakeEngine | None = None,
+    substitution: FakeSubstitution | None = None,
     clock: datetime = NOW,
     **config_overrides: Any,  # noqa: ANN401 -- forwarded to config()
 ) -> Harness:
@@ -334,6 +420,8 @@ def harness(
     producer = FakeProducer(journal)
     engine = engine or FakeEngine(journal)
     engine.journal = journal
+    substitution = substitution or FakeSubstitution(journal)
+    substitution.journal = journal
     sleeps: list[float] = []
     exits: list[int] = []
     beats: list[int] = []
@@ -342,10 +430,68 @@ def harness(
         producer=producer,
         engine=engine,
         config=config(**config_overrides),
+        substitute=substitution,
         clock=lambda: clock,
         sleep=sleeps.append,
         hard_exit=exits.append,
         heartbeat=lambda: beats.append(1),
     )
     consumer.on_idle = worker.request_stop  # stop when the queue is drained
-    return Harness(worker, consumer, producer, engine, journal, sleeps, exits, beats)
+    return Harness(worker, consumer, producer, engine, substitution, journal, sleeps, exits, beats)
+
+
+# ---------------------------------------------------------------- job lifecycle (spec §05)
+
+TERMINAL = frozenset({"done", "infeasible", "rejected", "timeout", "failed"})
+COMPLETED_STATE = {
+    "OPTIMAL": "done",
+    "FEASIBLE": "done",
+    "INFEASIBLE": "infeasible",
+    "UNKNOWN": "timeout",
+    "MODEL_INVALID": "failed",
+    "EXPIRED": "failed",
+}
+
+
+def instant(text: str) -> datetime:
+    return datetime.fromisoformat(text).astimezone(UTC)
+
+
+@dataclass
+class ReferenceJob:
+    """Reference job state machine of timetable (spec §05), test-only: it replays the
+    contracts job-lifecycle scenarios and the solver's own events (watchdog included)."""
+
+    queue_deadline_at: datetime
+    time_limit_s: int
+    margin_s: int
+    state: str = "queued"
+    run_deadline_at: datetime | None = None
+    seen: set[str] = field(default_factory=set[str])
+
+    def on_event(self, event: Json) -> bool:
+        if event["event_id"] in self.seen or self.state in TERMINAL:
+            return False
+        self.seen.add(event["event_id"])
+        data: Json = event["data"]
+        if event["type"] == "solve.started":
+            if self.state != "queued":
+                return False
+            self.state = "running"
+            limit = timedelta(seconds=self.time_limit_s + self.margin_s)
+            self.run_deadline_at = instant(data["started_at"]) + limit
+            return True
+        self.state = COMPLETED_STATE[data["status"]]
+        return True
+
+    def on_watchdog(self, now: datetime) -> bool:
+        overdue_queue = self.state == "queued" and now > self.queue_deadline_at
+        overdue_run = (
+            self.state == "running"
+            and self.run_deadline_at is not None
+            and now > self.run_deadline_at
+        )
+        if overdue_queue or overdue_run:
+            self.state = "failed"
+            return True
+        return False

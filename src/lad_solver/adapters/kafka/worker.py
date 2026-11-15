@@ -3,10 +3,10 @@
 Per message: poll -> route by topic -> parse ->
   * poison (no school_id / job_id)         -> DLQ copy (best effort) -> commit
   * rejected (invalid data, unknown MAJOR) -> solve.completed MODEL_INVALID -> DLQ copy -> commit
-  * unsupported (substitution until stage 2, ADR 2026-11-15)
-                                           -> solve.completed MODEL_INVALID (no started) -> commit
   * expired (queue_deadline_at passed)     -> solve.completed EXPIRED (no started) -> commit
   * accepted -> solve.started -> flush + delivery check -> commit -> solve -> solve.completed
+A build job runs the timetable engine; a substitution job the substitution engine (stage 2, ADR
+2026-11-15-solver-substitution-engine), whose answer carries ``data.substitution``.
 The DLQ copy goes to the DLQ of the topic the message came from.
 A stop requested before ``solve.started`` leaves the message uncommitted (redelivered later).
 The DLQ is diagnostics only (events-kafka rules): a failed DLQ copy is logged, never retried.
@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from logging import ERROR, INFO, WARNING
-from typing import Final
+from typing import Final, Protocol
 
 from pydantic import BaseModel
 
@@ -48,7 +48,7 @@ from lad_solver.adapters.kafka.mapping import (
     Poison,
     Provenance,
     Rejected,
-    Unsupported,
+    SubstitutionAccepted,
     address_of,
     completed_data,
     completed_message,
@@ -58,6 +58,8 @@ from lad_solver.adapters.kafka.mapping import (
     parse_substitution_request,
     rejected_data,
     started_message,
+    substitution_data,
+    substitution_params,
 )
 from lad_solver.adapters.kafka.ports import (
     ConsumerPort,
@@ -66,10 +68,13 @@ from lad_solver.adapters.kafka.ports import (
     InboundMessage,
     OutboundMessage,
     ProducerPort,
+    SubstitutionEngine,
     TransientKafkaError,
 )
+from lad_solver.app.substitute import NUM_WORKERS as SUBSTITUTION_WORKERS
 from lad_solver.domain.problem import Params, Problem
-from lad_solver.domain.result import ConflictRule, Result, SolveStatus
+from lad_solver.domain.result import ConflictRule, Result, SolveStatus, StopReason
+from lad_solver.domain.substitution import ProposalKind, SubstitutionResult
 from lad_solver.model.progress import Progress
 from lad_solver.model.stop import StopHandle
 
@@ -86,6 +91,12 @@ EXIT_FAILURE: Final = 1
 
 class WorkerFatalError(Exception):
     """Stop the process with exit code 1 (compose restarts it)."""
+
+
+class _Running(Protocol):
+    """The solve in flight (a ``Future`` of either engine)."""
+
+    def done(self) -> bool: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,6 +131,7 @@ class Worker:
     producer: ProducerPort
     engine: Engine
     config: WorkerConfig
+    substitute: SubstitutionEngine
     clock: Callable[[], datetime] = _utc_now
     monotonic: Callable[[], float] = time.monotonic
     sleep: Callable[[float], None] = time.sleep
@@ -131,7 +143,7 @@ class Worker:
     _consumer_errors: int = field(default=0, init=False)
     _current: Address | None = field(default=None, init=False)  # job being handled
     _last: Address | None = field(default=None, init=False)  # last job handled
-    _solving: Future[Result] | None = field(default=None, init=False)
+    _solving: _Running | None = field(default=None, init=False)
     _received_at: float = field(default=0.0, init=False)  # monotonic, when handle() began
     _routes: dict[str, Route] = field(default_factory=dict[str, Route], init=False)
 
@@ -259,9 +271,7 @@ class Worker:
                     self._on_poison(message, route, error_class)
                 case Rejected():
                     self._on_rejected(message, route, outcome)
-                case Unsupported():
-                    self._on_unsupported(message, outcome)
-                case Accepted():
+                case Accepted() | SubstitutionAccepted():
                     now = self.clock()
                     if outcome.queue_deadline_at <= now:
                         self._on_expired(message, outcome, now)
@@ -326,20 +336,25 @@ class Worker:
         address = outcome.address
         completed = self._completed(address, rejected_data(address.job_id, outcome.code))
         self._send_completed(completed, address)
-        self._send_dlq(message, route, outcome.error_class, address)
+        self._send_dlq(message, route, outcome.error_class, address, outcome.reason)
         self._commit(message, address)
-        self._log_completed(address, completed, error_class=outcome.error_class)
+        # The rule the request broke, so producer bugs can be found (a literal or a field path).
+        jsonlog.log(
+            WARNING,
+            "job.rejected",
+            **_ids(address),
+            topic=message.topic,
+            error_code=outcome.code.value,
+            error_class=outcome.error_class,
+            reason=outcome.reason,
+        )
+        self._log_completed(
+            address, completed, error_class=outcome.error_class, reason=outcome.reason
+        )
 
-    def _on_unsupported(self, message: InboundMessage, outcome: Unsupported) -> None:
-        """Answer at once, so timetable fails the job now instead of at queue_deadline_at."""
-        address = outcome.address
-        data = rejected_data(address.job_id, ErrorCode.UNSUPPORTED_JOB_TYPE)
-        completed = self._completed(address, data)
-        self._send_completed(completed, address)
-        self._commit(message, address)
-        self._log_completed(address, completed, error_class=ErrorCode.UNSUPPORTED_JOB_TYPE.value)
-
-    def _on_expired(self, message: InboundMessage, outcome: Accepted, now: datetime) -> None:
+    def _on_expired(
+        self, message: InboundMessage, outcome: Accepted | SubstitutionAccepted, now: datetime
+    ) -> None:
         address = outcome.address
         data = completed_data(address.job_id, Result(status=SolveStatus.EXPIRED), None)
         completed = self._completed(address, data)
@@ -347,7 +362,9 @@ class Worker:
         self._commit(message, address)
         self._log_completed(address, completed, queue_wait_ms=_ms_between(outcome, now))
 
-    def _on_accepted(self, message: InboundMessage, outcome: Accepted, now: datetime) -> None:
+    def _on_accepted(
+        self, message: InboundMessage, outcome: Accepted | SubstitutionAccepted, now: datetime
+    ) -> None:
         if self._stopping():  # nothing promised yet: leave it uncommitted for the next start
             return
         address = outcome.address
@@ -355,7 +372,14 @@ class Worker:
         started = started_message(address, now, config.status_topic)
         self._send([started], config.started_flush_timeout_s, STARTED, address)
         self._commit(message, address)
+        if isinstance(outcome, SubstitutionAccepted):
+            self._substitute(outcome, now)
+        else:
+            self._build(outcome, now)
 
+    def _build(self, outcome: Accepted, now: datetime) -> None:
+        address = outcome.address
+        config = self.config
         params = params_for(
             outcome.data,
             min_time_limit_s=config.min_time_limit_s,
@@ -370,6 +394,7 @@ class Worker:
             INFO,
             "job.started",
             **_ids(address),
+            job_kind="build",
             queue_wait_ms=_ms_between(outcome, now),
             time_limit_s=params.time_limit_s,
             num_workers=params.num_workers,
@@ -389,7 +414,7 @@ class Worker:
         completed = self._completed(address, data)
         self._send_completed(completed, address)
         if error_code is not None:  # the engine failed: there is no search telemetry to report
-            self._log_completed(address, completed, wall_time_ms=wall_time_ms)
+            self._log_completed(address, completed, job_kind="build", wall_time_ms=wall_time_ms)
             return
         stats = result.stats
         if stats.coverage_status in _IMPOSSIBLE_COVERAGE:
@@ -403,6 +428,7 @@ class Worker:
         self._log_completed(
             address,
             completed,
+            job_kind="build",
             wall_time_ms=wall_time_ms,
             first_solution_ms=_ms(stats.first_solution_s),
             last_improvement_ms=_ms(stats.last_improvement_s),
@@ -418,6 +444,125 @@ class Worker:
             zero_day_before=stats.zero_day_before,
             zero_day_after=stats.zero_day_after,
             phase_b_retry_days=stats.phase_b_retry_days,
+        )
+
+    def _substitute(self, outcome: SubstitutionAccepted, now: datetime) -> None:
+        """Steps 1-3 of a substitution job; there is always a solution unless the engine fails."""
+        address = outcome.address
+        config = self.config
+        request = outcome.request
+        params = substitution_params(
+            outcome.data,
+            min_time_limit_s=config.min_time_limit_s,
+            max_time_limit_s=config.max_time_limit_s,
+            max_memory_mb=config.max_memory_mb,
+        )
+        jsonlog.log(
+            INFO,
+            "job.started",
+            **_ids(address),
+            job_kind="substitution",
+            queue_wait_ms=_ms_between(outcome, now),
+            time_limit_s=params.time_limit_s,
+            num_workers=SUBSTITUTION_WORKERS,
+            # what changes the algorithm, so a dropped or misspelled field shows (counts only)
+            step3=request.step3,
+            absence_rows=None if request.absences is None else len(request.absences),
+            approved_rows=len(request.approved),
+            ignored_fields=outcome.ignored_fields,
+        )
+        if outcome.ignored_fields > 0:
+            jsonlog.log(
+                WARNING, "job.unknown_fields", **_ids(address), count=outcome.ignored_fields
+            )
+        if request.allow_support_moves:  # conditional deviation (contracts README item 9)
+            jsonlog.log(WARNING, "job.support_moves_ignored", **_ids(address))
+
+        def substitute(stop: StopHandle, _progress: Progress) -> SubstitutionResult:
+            return self.substitute(request, params, stop)
+
+        began = self.monotonic()
+        result = self._run(address, substitute, params.time_limit_s)
+        wall_time_ms = round((self.monotonic() - began) * 1000)
+        data = self._substitution_data(address, result, outcome.input_sha256, wall_time_ms)
+        completed = self._completed(address, data)
+        self._send_completed(completed, address)
+        if result is None:  # the engine failed: there is no search telemetry to report
+            self._log_completed(
+                address, completed, job_kind="substitution", wall_time_ms=wall_time_ms
+            )
+            return
+        self._log_substitution(address, completed, result, wall_time_ms)
+
+    @staticmethod
+    def _substitution_data(
+        address: Address, result: SubstitutionResult | None, digest: str, wall_time_ms: int
+    ) -> dict[str, object]:
+        """The answer; a result that cannot be encoded is an engine bug, answered as internal
+        at once (the offset is committed: timetable would otherwise wait for its watchdog)."""
+        if result is None:
+            return rejected_data(address.job_id, ErrorCode.INTERNAL)
+        provenance = Provenance(wall_time_ms=wall_time_ms, input_sha256=digest)
+        try:
+            return substitution_data(address.job_id, result, provenance)
+        except Exception as exc:  # noqa: BLE001 -- logged with its class and location
+            jsonlog.log(
+                ERROR,
+                "result.encode_failed",
+                **_ids(address),
+                error_class=type(exc).__name__,
+                where=jsonlog.where(exc),
+            )
+            return rejected_data(address.job_id, ErrorCode.INTERNAL)
+
+    def _log_substitution(
+        self,
+        address: Address,
+        completed: Completed,
+        result: SubstitutionResult,
+        wall_time_ms: int,
+    ) -> None:
+        stats = result.stats
+        self_study = sum(p.kind is ProposalKind.SELF_STUDY for p in result.proposals)
+        for step, status in stats.anomalies:  # an INFEASIBLE / MODEL_INVALID step: engine bug
+            jsonlog.log(
+                ERROR,
+                "engine.substitution_anomaly",
+                **_ids(address),
+                step=step,
+                status=status.value,
+                count=len(stats.anomalies),
+            )
+        if stats.stop_reason in {StopReason.STOPPED, StopReason.TIME_LIMIT}:
+            # The best found so far: lessons left open are self-study without a full search.
+            jsonlog.log(
+                WARNING,
+                "job.partial",
+                **_ids(address),
+                stop_reason=stats.stop_reason.value,
+                self_study_count=self_study,
+            )
+        if stats.absences_completed or stats.overlays_ignored:
+            # The request was read the safe way (absent all day) or had moot overlays.
+            jsonlog.log(
+                WARNING,
+                "job.request_repaired",
+                **_ids(address),
+                absences_completed=stats.absences_completed,
+                overlays_ignored=stats.overlays_ignored,
+            )
+        self._log_completed(
+            address,
+            completed,
+            job_kind="substitution",
+            wall_time_ms=wall_time_ms,
+            stop_reason=stats.stop_reason.value,
+            num_workers=stats.num_workers,
+            step=result.step,
+            proposal_count=len(result.proposals),
+            self_study_count=self_study,
+            covered_by_step=list(stats.covered),
+            cp_runs=stats.runs,
         )
 
     @staticmethod
@@ -440,17 +585,32 @@ class Worker:
     def _solve(
         self, address: Address, problem: Problem, params: Params
     ) -> tuple[Result, ErrorCode | None]:
+        def build(stop: StopHandle, progress: Progress) -> Result:  # named: logs show "where"
+            return self.engine(problem, params, stop, progress)
+
+        result = self._run(address, build, params.time_limit_s)
+        if result is None:
+            return Result(status=SolveStatus.MODEL_INVALID), ErrorCode.INTERNAL
+        return result, None
+
+    def _run[T](
+        self,
+        address: Address,
+        call: Callable[[StopHandle, Progress], T],
+        time_limit_s: float,
+    ) -> T | None:
+        """Run an engine in its own thread; ``None`` if it raised (logged, never retried)."""
         stop = StopHandle()
         progress = Progress()
         if self._stop_requested:  # the signal arrived before the handle existed
             stop.stop()
-        future: Future[Result] = Future()
+        future: Future[T] = Future()
 
         def target() -> None:
             if not future.set_running_or_notify_cancel():
                 return
             try:
-                future.set_result(self.engine(problem, params, stop, progress))
+                future.set_result(call(stop, progress))
             except BaseException as exc:  # noqa: BLE001 -- handed over to the main thread
                 future.set_exception(exc)
 
@@ -461,7 +621,7 @@ class Worker:
             target=target, name="lad-solve", daemon=True, context=contextvars.copy_context()
         )
         watchdog = threading.Timer(
-            params.time_limit_s + self.config.watchdog_margin_s, self._watchdog, args=(address,)
+            time_limit_s + self.config.watchdog_margin_s, self._watchdog, args=(address,)
         )
         watchdog.daemon = True
         self._solving = future
@@ -482,11 +642,11 @@ class Worker:
                 error_class=type(exc).__name__,
                 where=jsonlog.where(exc),
             )
-            return Result(status=SolveStatus.MODEL_INVALID), ErrorCode.INTERNAL
-        return future.result(), None
+            return None
+        return future.result()
 
-    def _wait(
-        self, future: Future[Result], stop: StopHandle, progress: Progress, address: Address
+    def _wait[T](
+        self, future: Future[T], stop: StopHandle, progress: Progress, address: Address
     ) -> None:
         stop_deadline: float | None = None
         stall_check = True
@@ -588,7 +748,12 @@ class Worker:
         self._send([completed.message], self.config.completed_flush_timeout_s, COMPLETED, address)
 
     def _send_dlq(
-        self, message: InboundMessage, route: Route, error_class: str, address: Address | None
+        self,
+        message: InboundMessage,
+        route: Route,
+        error_class: str,
+        address: Address | None,
+        reason: str | None = None,
     ) -> None:
         """Best effort: the DLQ is diagnostics only; one attempt, then log and move on.
 
@@ -597,7 +762,11 @@ class Worker:
         """
         try:
             dlq = dlq_message(
-                message, topic=route.dlq_topic, error_class=error_class, models=route.dlq_models
+                message,
+                topic=route.dlq_topic,
+                error_class=error_class,
+                models=route.dlq_models,
+                reason=reason,
             )
             self.producer.send([dlq], self._flush_timeout(self.config.started_flush_timeout_s))
         except FatalKafkaError:
@@ -676,7 +845,7 @@ def _gap(objective: int | None, bound: float | None) -> float | None:
     return round(max(0.0, (bound - objective) / bound), 4)
 
 
-def _ms_between(outcome: Accepted, now: datetime) -> int | None:
+def _ms_between(outcome: Accepted | SubstitutionAccepted, now: datetime) -> int | None:
     if outcome.requested_at is None or outcome.requested_at.tzinfo is None:
         return None
     return round((now - outcome.requested_at).total_seconds() * 1000)

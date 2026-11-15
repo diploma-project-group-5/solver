@@ -89,14 +89,25 @@ CASES: dict[str, Json] = {
 
 
 def _substitution_with_personal_data(document: Json) -> Json:
+    """Names where a careless producer would add them: fields the contract does not know."""
+
     def add(data: Json) -> None:
-        data["absent_teacher_id"] = MARKER  # a signature typed into the absent teacher's id
         data["absent_teacher_name"] = MARKER
         data["lessons"][0]["teacher_signature"] = MARKER
+        data["teachers"][0]["signature"] = MARKER
+        data["absences"] = [
+            {"teacher_id": "t-1", "date": "2026-11-11", "lesson_nos": [2], "reason": MARKER},
+            {"teacher_id": "t-1", "date": "2026-11-12", "lesson_nos": None, "reason": MARKER},
+        ]
 
     changed = with_data(document, add)
     changed["source"] = MARKER
     return changed
+
+
+def _in_absent_teacher_id(document: Json) -> Json:
+    """A signature typed into the absent teacher's id: an invalid id, so the job is rejected."""
+    return with_data(document, lambda d: d.update(absent_teacher_id=MARKER))
 
 
 def _other_major(document: Json) -> Json:
@@ -107,8 +118,11 @@ def _other_major(document: Json) -> Json:
 
 
 SUBSTITUTION_CASES: dict[str, Json] = {
-    "substitution-unsupported": _substitution_with_personal_data(substitution_request()),
+    "substitution-accepted": _substitution_with_personal_data(substitution_request()),
     "substitution-rejected": _other_major(_substitution_with_personal_data(substitution_request())),
+    "substitution-rejected-id": _in_absent_teacher_id(
+        _substitution_with_personal_data(substitution_request())
+    ),
     "substitution-poison": with_data(
         _substitution_with_personal_data(substitution_request()), _no_job_id
     ),
@@ -148,6 +162,16 @@ def test_marker_never_reaches_the_engine() -> None:
 
     problem, _ = h.engine.calls[0]
     assert MARKER not in repr(problem)
+
+
+def test_marker_never_reaches_the_substitution_engine() -> None:
+    h = harness()
+
+    h.run(inbound(encode(SUBSTITUTION_CASES["substitution-accepted"]), topic=SUBSTITUTION_TOPIC))
+
+    [(request, _)] = h.substitution.calls
+    assert MARKER not in repr(request)
+    assert h.producer.of_type("solve.completed")[0]["data"]["status"] == "OPTIMAL"
 
 
 def test_validation_errors_do_not_quote_input() -> None:

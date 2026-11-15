@@ -34,6 +34,7 @@ class SolverConfig:
 class RunInfo:
     status: SolveStatus
     best_bound: float | None
+    deterministic_time: float = 0.0  # of the search; 0.0 when the run returned without one
 
 
 class _Solutions(cp_model.CpSolverSolutionCallback):
@@ -100,4 +101,4 @@ def run(
             stop.detach()
     found = status in {SolveStatus.OPTIMAL, SolveStatus.FEASIBLE}
     bound = solver.best_objective_bound if found and has_objective else None
-    return solver, RunInfo(status, bound)
+    return solver, RunInfo(status, bound, solver.deterministic_time)

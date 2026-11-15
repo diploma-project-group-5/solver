@@ -188,3 +188,8 @@ def _node() -> str:
         msg = "node is not on PATH: the validator-lib CLI needs Node 24"
         raise AssertionError(msg)
     return node
+
+
+def node_path() -> str:
+    """The ``node`` binary that runs the CLI (shared with ``substitution_golden``)."""
+    return _node()

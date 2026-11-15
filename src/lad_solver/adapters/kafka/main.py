@@ -14,14 +14,26 @@ from lad_solver.adapters.kafka.kafka_io import KafkaConsumer, KafkaProducer
 from lad_solver.adapters.kafka.mapping import MODEL_VERSION
 from lad_solver.adapters.kafka.worker import EXIT_FAILURE, Worker
 from lad_solver.app.solve import solve
+from lad_solver.app.substitute import substitute
 from lad_solver.domain.problem import Params, Problem
 from lad_solver.domain.result import Result
+from lad_solver.domain.substitution import (
+    SubstitutionParams,
+    SubstitutionRequest,
+    SubstitutionResult,
+)
 from lad_solver.model.progress import Progress
 from lad_solver.model.stop import StopHandle
 
 
 def _engine(problem: Problem, params: Params, stop: StopHandle, progress: Progress) -> Result:
     return solve(problem, params, stop, progress=progress)
+
+
+def _substitution_engine(
+    request: SubstitutionRequest, params: SubstitutionParams, stop: StopHandle
+) -> SubstitutionResult:
+    return substitute(request, params, stop)
 
 
 def touch(path: Path) -> None:
@@ -48,7 +60,7 @@ def run(env: Mapping[str, str] | None = None) -> int:
 
     consumer: KafkaConsumer | None = None
     try:
-        # Substitution jobs are refused at once until the stage 2 engine (ADR 2026-11-15).
+        # One group for build and substitution jobs (spec §03).
         consumer = KafkaConsumer(config, list(config.consumed_topics))
         producer = KafkaProducer(config)
     except Exception as exc:  # noqa: BLE001 -- bad client config / librdkafka init; class only
@@ -61,6 +73,7 @@ def run(env: Mapping[str, str] | None = None) -> int:
         producer=producer,
         engine=_engine,
         config=config,
+        substitute=_substitution_engine,
         heartbeat=lambda: touch(config.heartbeat_file),
     )
     install_signal_handlers(worker)

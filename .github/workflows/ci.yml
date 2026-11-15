@@ -43,7 +43,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7, resolved 2026-11-08
         with:
           repository: diploma-project-group-5/validator-lib
-          ref: 110c2462803abacf8d285ea635188b7042ff03db  # tag v0.3.1
+          ref: d4952fc4a91d49a1557585853872bb42e3e54744  # tag v0.4.0 (--mode new-conflicts)
           path: _validator
           persist-credentials: false
 
@@ -65,13 +65,14 @@ jobs:
       - name: Type check
         run: uv run pyright
 
-      # Contract conformance (schemas, topic manifest, job-lifecycle vectors) runs against a pinned
-      # contracts commit. Bump CONTRACTS_REF together with any change to the solver's events.
+      # Contract conformance (schemas, topic manifest, job-lifecycle and substitution-solve vectors,
+      # the week vectors of the golden substitution check) runs against a pinned contracts commit.
+      # Bump the ref together with any change to the solver's events.
       - name: Check out contracts
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7, resolved 2026-11-08
         with:
           repository: diploma-project-group-5/contracts
-          ref: 32ce02c5ddd8ecc61caba8f3c2a5bcc0a0f30bd8  # tag v0.4.0
+          ref: 5c0f3dd299dabc6fccd3c675f19e0a199718c640  # tag v0.5.0
           path: _contracts
           persist-credentials: false
 
@@ -143,7 +144,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7, resolved 2026-11-08
         with:
           repository: diploma-project-group-5/validator-lib
-          ref: 110c2462803abacf8d285ea635188b7042ff03db  # tag v0.3.1
+          ref: d4952fc4a91d49a1557585853872bb42e3e54744  # tag v0.4.0 (--mode new-conflicts)
           path: _validator
           persist-credentials: false
 
