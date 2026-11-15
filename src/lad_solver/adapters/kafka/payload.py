@@ -1,6 +1,7 @@
 """Inbound event models (pydantic v2), hand-written after the ``contracts`` draft.
 
-Mirrors ``contracts/schemas/events/{envelope,solve.build.requested}.v1.json`` until the
+Mirrors ``contracts/schemas/events/{envelope,solve.build.requested}.v1.json`` (and the envelope of
+``solve.substitution.requested``) until the
 ``contracts`` pip package exists (ADR 2026-11-04 §4). Tolerant reader: unknown fields are ignored,
 so personal data that a producer might add by mistake (class names, teacher signatures) never
 reaches the engine.
@@ -129,3 +130,20 @@ class BuildRequested(_Model):
     correlation_id: str
     school_id: UUID
     data: BuildRequestedData
+
+
+class SubstitutionHead(_Model):
+    """Envelope + ``data.job_id`` of a substitution job: all the solver reads until stage 2.
+
+    The stage 2 draft of ``data`` is never parsed (ADR 2026-11-15). Also the DLQ projection of the
+    substitution topic: who is absent and which lessons never reach the DLQ copy.
+    """
+
+    event_id: UUID
+    type: Literal["solve.substitution.requested"]
+    schema_version: str
+    source: str | None = None
+    time: datetime | None = None
+    correlation_id: str
+    school_id: UUID
+    data: JobRef

@@ -48,7 +48,8 @@ def run(env: Mapping[str, str] | None = None) -> int:
 
     consumer: KafkaConsumer | None = None
     try:
-        consumer = KafkaConsumer(config, [config.build_topic])  # substitutions: stage 2
+        # Substitution jobs are refused at once until the stage 2 engine (ADR 2026-11-15).
+        consumer = KafkaConsumer(config, list(config.consumed_topics))
         producer = KafkaProducer(config)
     except Exception as exc:  # noqa: BLE001 -- bad client config / librdkafka init; class only
         jsonlog.log(ERROR, "kafka.init_failed", error_class=type(exc).__name__)
@@ -66,7 +67,7 @@ def run(env: Mapping[str, str] | None = None) -> int:
     jsonlog.log(
         INFO,
         "worker.ready",
-        topic=config.build_topic,
+        topics=list(config.consumed_topics),
         group_id=config.group_id,
         solver_version=__version__,
         model_version=MODEL_VERSION,

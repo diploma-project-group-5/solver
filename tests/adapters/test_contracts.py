@@ -18,12 +18,16 @@ from kafka_support import (
     JOB_ID,
     NOW,
     SCHOOL_ID,
+    SUBSTITUTION_TOPIC,
     Json,
     build_request,
+    config,
     decode,
     encode,
     feasible_result,
     harness,
+    inbound,
+    substitution_request,
     with_data,
 )
 from referencing import Registry, Resource
@@ -31,11 +35,15 @@ from referencing import Registry, Resource
 import golden
 from builders import OTHER, subjects
 from lad_solver.adapters.kafka.mapping import (
+    SUBSTITUTION_DLQ_MODELS,
     Address,
     ErrorCode,
     Provenance,
+    Unsupported,
     completed_data,
     completed_message,
+    dlq_value,
+    parse_substitution_request,
     rejected_data,
     started_message,
 )
@@ -159,6 +167,7 @@ def test_started_event_conforms() -> None:
         completed_data(UUID(JOB_ID), Result(status=SolveStatus.EXPIRED), None),
         rejected_data(UUID(JOB_ID), ErrorCode.INVALID_PAYLOAD),
         rejected_data(UUID(JOB_ID), ErrorCode.INTERNAL),
+        rejected_data(UUID(JOB_ID), ErrorCode.UNSUPPORTED_JOB_TYPE),
         completed_data(
             UUID(JOB_ID),
             Result(
@@ -182,6 +191,7 @@ def test_started_event_conforms() -> None:
         "expired",
         "invalid_payload",
         "internal",
+        "unsupported_job_type",
         "precheck-invalid-input",
         "engine-model-invalid",
     ],
@@ -212,6 +222,123 @@ def test_every_event_the_worker_publishes_conforms() -> None:
         assert _errors("solve.status.v1.json", event) == []
 
 
+def test_error_codes_match_the_schema_enum() -> None:
+    completed = _load(SCHEMAS / "solve.status.v1.json")["$defs"]["completed"]
+    enum = completed["properties"]["error"]["properties"]["code"]["enum"]
+
+    assert {code.value for code in ErrorCode} == set(enum)
+
+
+def test_substitution_answer_conforms_until_stage2_engine() -> None:
+    h = harness()
+
+    h.run(inbound(encode(substitution_request()), topic=SUBSTITUTION_TOPIC))
+
+    [event] = [decode(m) for m in h.producer.sent]
+    assert event["data"]["error"] == {"code": "unsupported_job_type"}
+    assert _errors("solve.status.v1.json", event) == []
+
+
+# Largest result the request schema allows: every class x school day x lesson slot holds one lesson
+# (a class never has two lessons at once), every id at its 64-character maximum.
+def _request_limits() -> tuple[int, int, int]:
+    request = _load(SCHEMAS / "solve.build.requested.v1.json")["$defs"]["data"]["properties"]
+    defs = _load(SCHEMAS / "defs.v1.json")["$defs"]
+    return (
+        request["classes"]["maxItems"],
+        request["school_days"]["maxItems"],
+        defs["lesson_no"]["maximum"],
+    )
+
+
+CLASSES, DAYS, LESSONS_PER_DAY = _request_limits() if SCHEMAS.is_dir() else (0, 0, 0)
+MAX_LESSONS, MAX_DAY_FORMATS = CLASSES * DAYS * LESSONS_PER_DAY, CLASSES * DAYS
+
+
+def _id(prefix: str, n: int) -> str:
+    return f"{prefix}{n:0>{64 - len(prefix)}}"
+
+
+def _largest_result(extra_lessons: int = 0, extra_formats: int = 0) -> Result:
+    slots = [
+        (c, d, n)
+        for c in range(CLASSES)
+        for d in range(1, DAYS + 1)
+        for n in range(1, LESSONS_PER_DAY + 1)
+    ]
+    slots += slots[:extra_lessons]
+    lessons = tuple(
+        Lesson(_id("c-", c), d, n, _id("s-", (c * 7 + n) % 500), _id("t-", (c + d) % 500))
+        for c, d, n in slots
+    )
+    formats = [(c, d) for c in range(CLASSES) for d in range(1, DAYS + 1)]
+    formats += formats[:extra_formats]
+    day_formats = tuple(DayFormat(_id("c-", c), d, in_person=d % 2 == 0) for c, d in formats)
+    stats = Stats(objective=2**40, best_bound=2.0**40, primary=10**6, secondary=10**6)
+    return Result(SolveStatus.FEASIBLE, lessons, day_formats, stats=stats)
+
+
+def _largest_data(extra_lessons: int = 0, extra_formats: int = 0) -> dict[str, object]:
+    provenance = Provenance(wall_time_ms=180_000, input_sha256="f" * 64)
+    return completed_data(UUID(JOB_ID), _largest_result(extra_lessons, extra_formats), provenance)
+
+
+def _status_event(data: dict[str, object]) -> Json:
+    """The envelope without the size cap, to check the schema's own item limits."""
+    big = completed_message(ADDRESS, data, now=NOW, topic="solve.status", max_bytes=10**9)
+    return decode(big.message)
+
+
+def test_result_item_limits_follow_from_the_request_limits() -> None:
+    completed = _load(SCHEMAS / "solve.status.v1.json")["$defs"]["completed"]["properties"]
+
+    assert completed["lessons"]["maxItems"] == MAX_LESSONS == 12000
+    assert completed["day_formats"]["maxItems"] == MAX_DAY_FORMATS == 1200
+
+
+def test_largest_possible_result_fits_the_schema_item_limits() -> None:
+    data = _largest_data()
+
+    lessons, day_formats = data["lessons"], data["day_formats"]
+    assert isinstance(lessons, list)
+    assert isinstance(day_formats, list)
+    assert (len(lessons), len(day_formats)) == (MAX_LESSONS, MAX_DAY_FORMATS)  # pyright: ignore[reportUnknownArgumentType]
+    assert _errors("solve.status.v1.json", _status_event(data)) == []
+
+
+def _nested_errors(error: Any) -> list[Any]:  # noqa: ANN401 -- jsonschema ValidationError
+    return [error, *(e for child in error.context for e in _nested_errors(child))]
+
+
+@pytest.mark.parametrize(
+    ("lessons", "formats", "field"), [(1, 0, "lessons"), (0, 1, "day_formats")]
+)
+def test_one_item_over_the_largest_result_breaks_the_schema(
+    lessons: int, formats: int, field: str
+) -> None:
+    event = _status_event(_largest_data(lessons, formats))
+
+    found = list(_validator("solve.status.v1.json").iter_errors(event))  # pyright: ignore[reportUnknownMemberType]
+
+    nested = [e for error in found for e in _nested_errors(error)]
+    assert [list(e.absolute_path) for e in nested if e.validator == "maxItems"] == [["data", field]]
+
+
+def test_largest_possible_result_becomes_result_too_large_within_the_limit() -> None:
+    limit = config().result_max_bytes  # production default, 900 KiB
+
+    completed = completed_message(
+        ADDRESS, _largest_data(), now=NOW, topic="solve.status", max_bytes=limit
+    )
+
+    value = completed.message.value or b""
+    assert (completed.status, completed.error_code) == ("MODEL_INVALID", ErrorCode.RESULT_TOO_LARGE)
+    assert len(value) <= limit
+    event = decode(completed.message)
+    assert event["data"]["conflicts"] == []
+    assert _errors("solve.status.v1.json", event) == []
+
+
 def test_error_is_only_allowed_with_model_invalid() -> None:
     event: Json = decode(
         completed_message(
@@ -224,6 +351,20 @@ def test_error_is_only_allowed_with_model_invalid() -> None:
     )
 
     assert _errors("solve.status.v1.json", event) != []
+
+
+def test_contract_substitution_example_is_unsupported_until_stage2_engine() -> None:
+    """The producer's real shape (contracts example), not only the test fixture."""
+    [path] = sorted((CONTRACTS / "examples" / "solve.substitution.requested.v1").glob("*.json"))
+    raw = path.read_bytes()
+    job_id = _load(path)["data"]["job_id"]
+
+    outcome = parse_substitution_request(raw)
+
+    assert isinstance(outcome, Unsupported)
+    assert str(outcome.address.job_id) == job_id
+    projected = json.loads(dlq_value(raw, SUBSTITUTION_DLQ_MODELS) or b"")["projected"]
+    assert projected["data"] == {"job_id": job_id}
 
 
 # ---------------------------------------------------------------- capacity vectors

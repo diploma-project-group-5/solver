@@ -68,9 +68,15 @@ def _config() -> WorkerConfig:
 
 
 def test_solver_consumes_only_topics_it_is_a_consumer_of() -> None:
-    topic = _topics()[_config().build_topic]
-    assert SOLVER in topic["consumers"]
-    assert topic["stage"] == 1
+    topics = _topics()
+    for name in _config().consumed_topics:
+        assert SOLVER in topics[name]["consumers"], name
+    assert topics[_config().build_topic]["stage"] == 1
+
+
+def test_substitution_topic_stays_stage_2_while_the_solver_refuses_it() -> None:
+    """ADR 2026-11-15: subscribed in stage 1 only to answer unsupported_job_type at once."""
+    assert _topics()[_config().substitution_topic]["stage"] == 2
 
 
 def test_solver_publishes_status_only_where_it_is_the_producer() -> None:
@@ -80,7 +86,8 @@ def test_solver_publishes_status_only_where_it_is_the_producer() -> None:
 def test_solver_dlq_follows_the_manifest_pattern() -> None:
     pattern: str = _load(MANIFEST)["dlq"]["pattern"]
     config = _config()
-    assert config.build_dlq_topic == pattern.replace("<topic>", config.build_topic)
+    for topic in config.consumed_topics:
+        assert config.dlq_for(topic) == pattern.replace("<topic>", topic)
 
 
 def test_manifest_has_no_retry_topics_and_keys_by_school() -> None:
@@ -146,7 +153,8 @@ def _scenarios() -> list[Path]:
 
 
 def test_lifecycle_scenarios_exist() -> None:
-    assert len(_scenarios()) >= 12
+    assert len(_scenarios()) >= 13
+    assert (LIFECYCLE / "13-substitution-unsupported.json").is_file()
 
 
 @pytest.mark.parametrize("path", _scenarios(), ids=lambda p: p.stem)
@@ -180,3 +188,22 @@ def test_solver_only_emits_statuses_covered_by_the_scenarios() -> None:
         if "event" in step and step["event"]["type"] == "solve.completed"
     }
     assert statuses == set(COMPLETED_STATE)
+
+
+def test_unsupported_job_type_is_covered_by_a_scenario() -> None:
+    """timetable closes a refused substitution job at once as failed (ADR 2026-11-15)."""
+    codes = {
+        step["event"]["data"]["error"]["code"]
+        for path in _scenarios()
+        for step in _load(path)["steps"]
+        if "event" in step and "error" in step["event"]["data"]
+    }
+    assert "unsupported_job_type" in codes
+
+
+def test_substitution_scenario_fails_at_once_without_started() -> None:
+    scenario = _load(LIFECYCLE / "13-substitution-unsupported.json")
+
+    assert scenario["job"]["kind"] == "substitution"
+    assert [step["event"]["type"] for step in scenario["steps"]] == ["solve.completed"]
+    assert scenario["expected"] == {"state": "failed", "ignored_steps": []}

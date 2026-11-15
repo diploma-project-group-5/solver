@@ -40,6 +40,20 @@ def test_cp_sat_knobs_at_their_bounds_are_accepted() -> None:
         ({"SOLVER_STATUS_TOPIC": "solve status"}, "SOLVER_STATUS_TOPIC"),
         ({"SOLVER_BUILD_TOPIC": "a" * 250}, "SOLVER_BUILD_TOPIC"),
         ({"SOLVER_BUILD_DLQ_TOPIC": "dlq/1"}, "SOLVER_BUILD_DLQ_TOPIC"),
+        ({"SOLVER_SUBSTITUTION_TOPIC": "solve.build.requested"}, "SOLVER_SUBSTITUTION_TOPIC"),
+        ({"SOLVER_SUBSTITUTION_TOPIC": "solve.status"}, "SOLVER_SUBSTITUTION_TOPIC"),
+        ({"SOLVER_SUBSTITUTION_TOPIC": "solve status"}, "SOLVER_SUBSTITUTION_TOPIC"),
+        # A DLQ equal to a consumed topic would feed every poison message back forever.
+        (
+            {"SOLVER_SUBSTITUTION_DLQ_TOPIC": "solve.substitution.requested"},
+            "SOLVER_SUBSTITUTION_DLQ_TOPIC",
+        ),
+        (
+            {"SOLVER_SUBSTITUTION_DLQ_TOPIC": "solve.build.requested"},
+            "SOLVER_SUBSTITUTION_DLQ_TOPIC",
+        ),
+        ({"SOLVER_BUILD_DLQ_TOPIC": "solve.substitution.requested"}, "SOLVER_BUILD_DLQ_TOPIC"),
+        ({"SOLVER_SUBSTITUTION_DLQ_TOPIC": "dlq/1"}, "SOLVER_SUBSTITUTION_DLQ_TOPIC"),
     ],
 )
 def test_topics_must_be_distinct_legal_names(env: dict[str, str], variable: str) -> None:
@@ -81,3 +95,30 @@ def test_result_max_bytes_stays_below_the_producer_message_limit() -> None:
         _load(SOLVER_RESULT_MAX_BYTES="1000000")
     assert _load(SOLVER_RESULT_MAX_BYTES="990000").result_max_bytes == 990_000
     assert _load().result_max_bytes == 900 * 1024
+
+
+def test_substitution_topics_default_to_the_manifest_names() -> None:
+    loaded = _load()
+
+    assert loaded.substitution_topic == "solve.substitution.requested"
+    assert loaded.substitution_dlq_topic == "solve.substitution.requested.dlq"
+    assert loaded.consumed_topics == ("solve.build.requested", "solve.substitution.requested")
+
+
+def test_substitution_topics_come_from_env() -> None:
+    loaded = _load(SOLVER_SUBSTITUTION_TOPIC="subst.x", SOLVER_SUBSTITUTION_DLQ_TOPIC="subst.x.dlq")
+
+    assert loaded.consumed_topics == ("solve.build.requested", "subst.x")
+    assert loaded.dlq_for("subst.x") == "subst.x.dlq"
+    assert loaded.dlq_for("solve.build.requested") == "solve.build.requested.dlq"
+
+
+@pytest.mark.parametrize("variable", ["SOLVER_SUBSTITUTION_TOPIC", "SOLVER_SUBSTITUTION_DLQ_TOPIC"])
+def test_empty_substitution_topic_fails_fast(variable: str) -> None:
+    with pytest.raises(ConfigError, match=f"{variable} must not be empty"):
+        _load(**{variable: " "})
+
+
+def test_dlq_for_a_topic_the_worker_does_not_consume_is_an_error() -> None:
+    with pytest.raises(KeyError):
+        _load().dlq_for("solve.status")

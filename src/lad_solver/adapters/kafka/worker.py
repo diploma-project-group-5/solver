@@ -1,10 +1,13 @@
 """The worker loop (ADR 2026-11-04 §4), written against ports so it is unit-testable.
 
-Per message: poll -> parse ->
+Per message: poll -> route by topic -> parse ->
   * poison (no school_id / job_id)         -> DLQ copy (best effort) -> commit
   * rejected (invalid data, unknown MAJOR) -> solve.completed MODEL_INVALID -> DLQ copy -> commit
+  * unsupported (substitution until stage 2, ADR 2026-11-15)
+                                           -> solve.completed MODEL_INVALID (no started) -> commit
   * expired (queue_deadline_at passed)     -> solve.completed EXPIRED (no started) -> commit
   * accepted -> solve.started -> flush + delivery check -> commit -> solve -> solve.completed
+The DLQ copy goes to the DLQ of the topic the message came from.
 A stop requested before ``solve.started`` leaves the message uncommitted (redelivered later).
 The DLQ is diagnostics only (events-kafka rules): a failed DLQ copy is logged, never retried.
 
@@ -23,26 +26,33 @@ from datetime import UTC, datetime
 from logging import ERROR, INFO, WARNING
 from typing import Final
 
+from pydantic import BaseModel
+
 from lad_solver import __version__
 from lad_solver.adapters.kafka import jsonlog
 from lad_solver.adapters.kafka.config import WorkerConfig
 from lad_solver.adapters.kafka.mapping import (
+    BUILD_DLQ_MODELS,
     COMPLETED,
     MODEL_VERSION,
     STARTED,
+    SUBSTITUTION_DLQ_MODELS,
     Accepted,
     Address,
     Completed,
     ErrorCode,
+    ParseOutcome,
     Poison,
     Provenance,
     Rejected,
+    Unsupported,
     address_of,
     completed_data,
     completed_message,
     dlq_message,
     params_for,
     parse_build_request,
+    parse_substitution_request,
     rejected_data,
     started_message,
 )
@@ -74,6 +84,28 @@ class WorkerFatalError(Exception):
     """Stop the process with exit code 1 (compose restarts it)."""
 
 
+@dataclass(frozen=True, slots=True)
+class Route:
+    """How messages of one consumed topic are parsed and where their DLQ copy goes."""
+
+    parse: Callable[[bytes | None], ParseOutcome]
+    dlq_topic: str
+    dlq_models: Sequence[type[BaseModel]]
+
+
+def routes_for(config: WorkerConfig) -> dict[str, Route]:
+    return {
+        config.build_topic: Route(
+            parse_build_request, config.dlq_for(config.build_topic), BUILD_DLQ_MODELS
+        ),
+        config.substitution_topic: Route(
+            parse_substitution_request,
+            config.dlq_for(config.substitution_topic),
+            SUBSTITUTION_DLQ_MODELS,
+        ),
+    }
+
+
 def _utc_now() -> datetime:
     return datetime.now(UTC)
 
@@ -97,6 +129,10 @@ class Worker:
     _last: Address | None = field(default=None, init=False)  # last job handled
     _solving: Future[Result] | None = field(default=None, init=False)
     _received_at: float = field(default=0.0, init=False)  # monotonic, when handle() began
+    _routes: dict[str, Route] = field(default_factory=dict[str, Route], init=False)
+
+    def __post_init__(self) -> None:
+        self._routes = routes_for(self.config)
 
     # ------------------------------------------------------------ lifecycle
 
@@ -207,16 +243,19 @@ class Worker:
 
     def handle(self, message: InboundMessage) -> None:
         self._received_at = self.monotonic()
+        route = self._route(message)
         try:
-            outcome = parse_build_request(message.value)
+            outcome = route.parse(message.value)
         except Exception as exc:  # noqa: BLE001 -- a parser bug must not crash-loop on one message
             outcome = self._parser_failed(message, exc)
         self._current = None if isinstance(outcome, Poison) else outcome.address
         match outcome:
             case Poison(error_class=error_class):
-                self._on_poison(message, error_class)
+                self._on_poison(message, route, error_class)
             case Rejected():
-                self._on_rejected(message, outcome)
+                self._on_rejected(message, route, outcome)
+            case Unsupported():
+                self._on_unsupported(message, outcome)
             case Accepted():
                 now = self.clock()
                 if outcome.queue_deadline_at <= now:
@@ -224,6 +263,20 @@ class Worker:
                 else:
                     self._on_accepted(message, outcome, now)
         self._last, self._current = self._current or self._last, None
+
+    def _route(self, message: InboundMessage) -> Route:
+        """The consumer subscribes to the routed topics only, so a miss is a configuration bug."""
+        route = self._routes.get(message.topic)
+        if route is None:
+            jsonlog.log(
+                ERROR,
+                "message.unrouted_topic",
+                topic=message.topic,
+                partition=message.partition,
+                offset=message.offset,
+            )
+            raise WorkerFatalError
+        return route
 
     def _parser_failed(self, message: InboundMessage, exc: Exception) -> Poison | Rejected:
         address = address_of(message.value)
@@ -242,7 +295,7 @@ class Worker:
             return Poison(error_class)
         return Rejected(address, ErrorCode.INTERNAL, error_class)
 
-    def _on_poison(self, message: InboundMessage, error_class: str) -> None:
+    def _on_poison(self, message: InboundMessage, route: Route, error_class: str) -> None:
         jsonlog.log(
             WARNING,
             "message.poison",
@@ -252,7 +305,7 @@ class Worker:
             error_class=error_class,
             size_bytes=len(message.value or b""),
         )
-        self._send_dlq(message, error_class, None)
+        self._send_dlq(message, route, error_class, None)
         self._commit(message, None)
         jsonlog.log(
             INFO,
@@ -264,13 +317,22 @@ class Worker:
             handle_ms=self._handle_ms(),
         )
 
-    def _on_rejected(self, message: InboundMessage, outcome: Rejected) -> None:
+    def _on_rejected(self, message: InboundMessage, route: Route, outcome: Rejected) -> None:
         address = outcome.address
         completed = self._completed(address, rejected_data(address.job_id, outcome.code))
         self._send_completed(completed, address)
-        self._send_dlq(message, outcome.error_class, address)
+        self._send_dlq(message, route, outcome.error_class, address)
         self._commit(message, address)
         self._log_completed(address, completed, error_class=outcome.error_class)
+
+    def _on_unsupported(self, message: InboundMessage, outcome: Unsupported) -> None:
+        """Answer at once, so timetable fails the job now instead of at queue_deadline_at."""
+        address = outcome.address
+        data = rejected_data(address.job_id, ErrorCode.UNSUPPORTED_JOB_TYPE)
+        completed = self._completed(address, data)
+        self._send_completed(completed, address)
+        self._commit(message, address)
+        self._log_completed(address, completed, error_class=ErrorCode.UNSUPPORTED_JOB_TYPE.value)
 
     def _on_expired(self, message: InboundMessage, outcome: Accepted, now: datetime) -> None:
         address = outcome.address
@@ -504,14 +566,18 @@ class Worker:
     def _send_completed(self, completed: Completed, address: Address) -> None:
         self._send([completed.message], self.config.completed_flush_timeout_s, COMPLETED, address)
 
-    def _send_dlq(self, message: InboundMessage, error_class: str, address: Address | None) -> None:
+    def _send_dlq(
+        self, message: InboundMessage, route: Route, error_class: str, address: Address | None
+    ) -> None:
         """Best effort: the DLQ is diagnostics only; one attempt, then log and move on.
 
         Any failure, including one while building the copy, is logged so the offset is still
         committed: otherwise one bad message would crash-loop the worker.
         """
         try:
-            dlq = dlq_message(message, topic=self.config.build_dlq_topic, error_class=error_class)
+            dlq = dlq_message(
+                message, topic=route.dlq_topic, error_class=error_class, models=route.dlq_models
+            )
             self.producer.send([dlq], self._flush_timeout(self.config.started_flush_timeout_s))
         except FatalKafkaError:
             raise  # the client is unusable (error_cb during flush): exit 1, not "best effort"

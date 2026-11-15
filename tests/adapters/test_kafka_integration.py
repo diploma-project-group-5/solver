@@ -29,6 +29,7 @@ from kafka_support import (
     Json,
     build_request,
     encode,
+    substitution_request,
 )
 from testcontainers.core.container import DockerContainer
 
@@ -101,6 +102,8 @@ class Topics:
     status: str
     dlq: str
     group: str
+    substitution: str
+    substitution_dlq: str
 
 
 @pytest.fixture
@@ -111,12 +114,20 @@ def topics(bootstrap: str) -> Topics:
         f"solve.status.{suffix}",
         f"solve.build.requested.{suffix}.dlq",
         f"lad-solver-{suffix}",
+        f"solve.substitution.requested.{suffix}",
+        f"solve.substitution.requested.{suffix}.dlq",
     )
     admin = AdminClient({"bootstrap.servers": bootstrap})
     futures = admin.create_topics(  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
         [
             NewTopic(name, num_partitions=1, replication_factor=1)
-            for name in (names.build, names.status, names.dlq)
+            for name in (
+                names.build,
+                names.status,
+                names.dlq,
+                names.substitution,
+                names.substitution_dlq,
+            )
         ]
     )
     for future in futures.values():  # pyright: ignore[reportUnknownVariableType]
@@ -131,6 +142,8 @@ def _config(bootstrap: str, topics: Topics) -> WorkerConfig:
         build_topic=topics.build,
         status_topic=topics.status,
         build_dlq_topic=topics.dlq,
+        substitution_topic=topics.substitution,
+        substitution_dlq_topic=topics.substitution_dlq,
     )
     config.validate()
     return config
@@ -182,10 +195,11 @@ def _read(bootstrap: str, topic: str, count: int) -> list[Received]:
     return received
 
 
-def _committed_offset(bootstrap: str, topics: Topics) -> int:
+def _committed_offset(bootstrap: str, topics: Topics, topic: str | None = None) -> int:
     consumer = Consumer({"bootstrap.servers": bootstrap, "group.id": topics.group})
     try:
-        [partition] = consumer.committed([TopicPartition(topics.build, 0)], timeout=30)
+        partitions = [TopicPartition(topic or topics.build, 0)]
+        [partition] = consumer.committed(partitions, timeout=30)
         return partition.offset
     finally:
         consumer.close()
@@ -207,7 +221,7 @@ class RunningWorker:
 def _start_worker(bootstrap: str, topics: Topics, engine: Engine) -> RunningWorker:
     config = _config(bootstrap, topics)
     worker = Worker(
-        consumer=KafkaConsumer(config, [config.build_topic]),
+        consumer=KafkaConsumer(config, list(config.consumed_topics)),
         producer=KafkaProducer(config),
         engine=engine,
         config=config,
@@ -296,6 +310,49 @@ def test_poison_message_lands_in_dlq_and_is_committed(bootstrap: str, topics: To
     }
     assert dead.headers["x-error-class"] == b"not_json"
     assert dead.headers["x-original-offset"] == b"0"
+
+
+def test_substitution_is_refused_at_once_and_committed_until_stage2_engine(
+    bootstrap: str, topics: Topics
+) -> None:
+    _send(bootstrap, topics.substitution, encode(substitution_request()))
+    engine = FakeEngine(Journal())
+    running = _start_worker(bootstrap, topics, engine)
+    try:
+        [completed] = _read(bootstrap, topics.status, 1)  # a solve.started would come first
+        _wait_until(
+            lambda: (
+                True if _committed_offset(bootstrap, topics, topics.substitution) == 1 else None
+            ),
+            "the commit",
+        )
+    finally:
+        assert running.stop() == 0
+
+    event = completed.json()
+    assert event["type"] == "solve.completed"
+    assert event["data"]["status"] == "MODEL_INVALID"
+    assert event["data"]["error"] == {"code": "unsupported_job_type"}
+    assert completed.key == SCHOOL_ID.encode()
+    assert engine.calls == []
+
+
+def test_broken_substitution_lands_in_its_own_dlq(bootstrap: str, topics: Topics) -> None:
+    _send(bootstrap, topics.substitution, b"definitely not json")
+    running = _start_worker(bootstrap, topics, FakeEngine(Journal()))
+    try:
+        [dead] = _read(bootstrap, topics.substitution_dlq, 1)
+        _wait_until(
+            lambda: (
+                True if _committed_offset(bootstrap, topics, topics.substitution) == 1 else None
+            ),
+            "the commit",
+        )
+    finally:
+        assert running.stop() == 0
+
+    assert dead.headers["x-original-topic"] == topics.substitution.encode()
+    assert dead.headers["x-error-class"] == b"not_json"
 
 
 _SLOW_WORKER = """

@@ -34,6 +34,7 @@ ALLOWED_FIELDS: Final = frozenset(
         "solver_version",
         "model_version",
         "topic",
+        "topics",  # consumed topic names from the config (worker.ready)
         "partition",
         "offset",
         "size_bytes",

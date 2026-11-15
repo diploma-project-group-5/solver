@@ -7,18 +7,27 @@ from uuid import UUID
 
 import pytest
 from kafka_support import (
+    DLQ_TOPIC,
     JOB_ID,
     SCHOOL_ID,
+    STATUS_TOPIC,
+    SUBSTITUTION_DLQ_TOPIC,
+    SUBSTITUTION_TOPIC,
     FakeEngine,
     Journal,
+    Json,
     build_request,
     decode,
     encode,
     harness,
+    inbound,
+    substitution_request,
     with_data,
 )
 
+from lad_solver.adapters.kafka import mapping
 from lad_solver.adapters.kafka.mapping import event_id
+from lad_solver.adapters.kafka.ports import InboundMessage
 from lad_solver.domain.result import Lesson, Result, SolveStatus
 
 
@@ -324,3 +333,152 @@ def test_unparseable_poison_with_personal_data_is_not_copied_to_the_dlq() -> Non
     value = h.producer.dlq()[0].value or b""
     assert b"signature" not in value
     assert "Іваненко".encode() not in value
+
+
+# ---------------------------------------------------------------- substitutions (stage 1)
+# ADR 2026-11-15: a substitution job is answered at once, until the stage 2 engine exists.
+
+
+def _substitution(document: Json | None = None, offset: int = 7) -> InboundMessage:
+    raw = encode(document if document is not None else substitution_request())
+    return inbound(raw, offset, topic=SUBSTITUTION_TOPIC)
+
+
+def test_substitution_is_answered_unsupported_at_once_until_stage2_engine() -> None:
+    h = harness()
+
+    assert h.run(_substitution()) == 0
+
+    assert h.journal.entries == ["send:solve.completed", "commit"]
+    assert h.engine.calls == []
+    assert h.producer.of_type("solve.started") == []
+    assert (h.producer.dlq(DLQ_TOPIC), h.producer.dlq(SUBSTITUTION_DLQ_TOPIC)) == ([], [])
+    assert h.consumer.committed == [7]
+    [message] = h.producer.sent
+    assert (message.topic, message.key) == (STATUS_TOPIC, SCHOOL_ID.encode())
+    event = decode(message)
+    assert event["type"] == "solve.completed"
+    assert event["event_id"] == str(event_id(UUID(JOB_ID), "solve.completed"))
+    assert event["correlation_id"] == "req-5f2c9a"
+    assert event["data"] == {
+        "job_id": JOB_ID,
+        "status": "MODEL_INVALID",
+        "lessons": [],
+        "day_formats": [],
+        "conflicts": [],
+        "error": {"code": "unsupported_job_type"},
+    }
+
+
+def test_substitution_redelivery_gives_the_same_event_until_stage2_engine() -> None:
+    h = harness()
+
+    h.run(_substitution(offset=7), _substitution(offset=7))
+
+    first, second = h.producer.sent
+    assert first.value == second.value  # same event_id: timetable's inbox drops the copy
+
+
+def test_expired_substitution_is_still_unsupported_not_expired_until_stage2_engine() -> None:
+    h = harness()
+
+    h.run(_substitution(substitution_request(queue_deadline_at="2026-11-01T00:00:00Z")))
+
+    data = h.producer.of_type("solve.completed")[0]["data"]
+    assert (data["status"], data["error"]) == ("MODEL_INVALID", {"code": "unsupported_job_type"})
+
+
+def test_unsupported_substitution_is_logged_as_completed_until_stage2_engine(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    h = harness()
+
+    h.run(_substitution())
+
+    lines = [json.loads(x) for x in capsys.readouterr().out.splitlines()]
+    [done] = [x for x in lines if x["msg"] == "job.completed"]
+    assert done["level"] == "info"
+    assert (done["job_id"], done["school_id"]) == (JOB_ID, SCHOOL_ID)
+    assert done["error_code"] == done["error_class"] == "unsupported_job_type"
+
+
+def test_poison_substitution_goes_to_the_substitution_dlq_until_stage2_engine() -> None:
+    h = harness()
+
+    assert h.run(inbound(b"not json", topic=SUBSTITUTION_TOPIC)) == 0
+
+    assert h.journal.entries == ["send:dlq", "commit"]
+    assert h.producer.dlq(DLQ_TOPIC) == []
+    [dead] = h.producer.dlq(SUBSTITUTION_DLQ_TOPIC)
+    assert dict(dead.headers)["x-original-topic"] == SUBSTITUTION_TOPIC.encode()
+    assert dict(dead.headers)["x-error-class"] == b"not_json"
+
+
+def test_rejected_substitution_is_answered_and_copied_to_its_dlq_until_stage2_engine() -> None:
+    h = harness()
+    document = substitution_request()
+    document["schema_version"] = "2.0"
+
+    h.run(_substitution(document))
+
+    assert h.journal.entries == ["send:solve.completed", "send:dlq", "commit"]
+    data = h.producer.of_type("solve.completed")[0]["data"]
+    assert data["error"] == {"code": "unsupported_schema_version"}
+    assert h.producer.dlq(DLQ_TOPIC) == []
+    [dead] = h.producer.dlq(SUBSTITUTION_DLQ_TOPIC)
+    projected = json.loads(dead.value or b"")["projected"]
+    assert projected["data"] == {"job_id": JOB_ID}  # the substitution projection, not the build one
+
+
+def test_substitution_parser_bug_is_internal_and_goes_to_its_dlq_until_stage2_engine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def broken(*_args: object) -> None:
+        msg = "bug"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(mapping, "_envelope_rejection", broken)
+    h = harness()
+
+    h.run(_substitution())
+
+    data = h.producer.of_type("solve.completed")[0]["data"]
+    assert (data["status"], data["error"]) == ("MODEL_INVALID", {"code": "internal"})
+    assert len(h.producer.dlq(SUBSTITUTION_DLQ_TOPIC)) == 1
+    assert h.consumer.committed == [7]
+
+
+def test_undelivered_substitution_answer_exits_without_commit_until_stage2_engine() -> None:
+    h = harness()
+    h.producer.fail_types["solve.completed"] = 99
+
+    assert h.run(_substitution()) == 1
+
+    assert h.sleeps == [1.0, 2.0, 4.0]
+    assert h.consumer.committed == []  # redelivered after the restart, answered again
+
+
+def test_build_after_a_substitution_is_still_solved_until_stage2_engine() -> None:
+    h = harness()
+
+    h.run(_substitution(offset=3), encode(build_request()))
+
+    assert h.journal.entries == [
+        "send:solve.completed",
+        "commit",
+        "send:solve.started",
+        "commit",
+        "solve",
+        "send:solve.completed",
+    ]
+    assert len(h.engine.calls) == 1
+
+
+def test_message_from_a_topic_without_a_route_stops_the_worker() -> None:
+    """Only a config bug can deliver one (the consumer subscribes to the routed topics)."""
+    h = harness()
+
+    assert h.run(inbound(encode(build_request()), topic="solve.other")) == 1
+
+    assert h.producer.sent == []
+    assert h.consumer.committed == []

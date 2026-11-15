@@ -39,6 +39,9 @@ JOB_ID = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d"
 BUILD_TOPIC = "solve.build.requested"
 STATUS_TOPIC = "solve.status"
 DLQ_TOPIC = "solve.build.requested.dlq"
+SUBSTITUTION_TOPIC = "solve.substitution.requested"
+SUBSTITUTION_DLQ_TOPIC = "solve.substitution.requested.dlq"
+DLQ_TOPICS = frozenset({DLQ_TOPIC, SUBSTITUTION_DLQ_TOPIC})
 
 type Json = dict[str, Any]
 
@@ -86,12 +89,41 @@ def build_request(**data_overrides: object) -> Json:
     }
 
 
+def substitution_request(**data_overrides: object) -> Json:
+    """A solve.substitution.requested envelope (stage 2 draft): who is absent and which lessons."""
+    data: Json = {
+        "job_id": JOB_ID,
+        "snapshot_version": 42,
+        "time_limit_s": 15,
+        "queue_deadline_at": "2026-11-04T10:10:00Z",
+        "date": "2026-11-11",
+        "absence_dates": ["2026-11-11", "2026-11-12"],
+        "absent_teacher_id": "t-1",
+        "lessons": [{"class_id": "c-5a", "lesson_no": 2}],
+        "not_before": "2026-11-10",
+        "iso_week": "2026-W46",
+        "teachers": [{"id": "t-1", "weekly_limit": 20, "unavailable_days": []}],
+        "approved_substitutions": [],
+    }
+    data.update(data_overrides)
+    return {
+        "event_id": "6f1d2c3b-4a5e-4f60-8b71-0c2d3e4f5a6d",
+        "type": "solve.substitution.requested",
+        "schema_version": "1.0",
+        "source": "timetable-service",
+        "time": "2026-11-04T09:59:00Z",
+        "correlation_id": "req-5f2c9a",
+        "school_id": SCHOOL_ID,
+        "data": data,
+    }
+
+
 def encode(document: Json) -> bytes:
     return json.dumps(document, ensure_ascii=False).encode()
 
 
-def inbound(value: bytes | None, offset: int = 7) -> InboundMessage:
-    return InboundMessage(BUILD_TOPIC, 0, offset, SCHOOL_ID.encode(), value)
+def inbound(value: bytes | None, offset: int = 7, *, topic: str = BUILD_TOPIC) -> InboundMessage:
+    return InboundMessage(topic, 0, offset, SCHOOL_ID.encode(), value)
 
 
 def with_data(document: Json, mutate: Callable[[Json], None]) -> Json:
@@ -170,7 +202,7 @@ class FakeConsumer:
 
 
 def _label(message: OutboundMessage) -> str:
-    if message.topic == DLQ_TOPIC:
+    if message.topic in DLQ_TOPICS:
         return "dlq"
     return str(decode(message)["type"])
 
@@ -222,8 +254,8 @@ class FakeProducer:
     def of_type(self, event_type: str) -> list[Json]:
         return [decode(m) for m in self.sent if m.topic == STATUS_TOPIC and _label(m) == event_type]
 
-    def dlq(self) -> list[OutboundMessage]:
-        return [m for m in self.sent if m.topic == DLQ_TOPIC]
+    def dlq(self, topic: str = DLQ_TOPIC) -> list[OutboundMessage]:
+        return [m for m in self.sent if m.topic == topic]
 
 
 @dataclass
@@ -263,6 +295,8 @@ def config(**overrides: Any) -> WorkerConfig:  # noqa: ANN401 -- forwarded to th
         "build_topic": BUILD_TOPIC,
         "status_topic": STATUS_TOPIC,
         "build_dlq_topic": DLQ_TOPIC,
+        "substitution_topic": SUBSTITUTION_TOPIC,
+        "substitution_dlq_topic": SUBSTITUTION_DLQ_TOPIC,
         "heartbeat_file": Path("/nonexistent/heartbeat"),
     } | overrides
     built = WorkerConfig(**values)
@@ -281,9 +315,11 @@ class Harness:
     exits: list[int]
     beats: list[int]
 
-    def run(self, *values: bytes | None) -> int:
+    def run(self, *values: bytes | InboundMessage | None) -> int:
+        """Raw values arrive on the build topic at offsets 7, 8, ...; messages are kept as given."""
         for offset, value in enumerate(values, start=7):
-            self.consumer.messages.append(inbound(value, offset))
+            message = value if isinstance(value, InboundMessage) else inbound(value, offset)
+            self.consumer.messages.append(message)
         return self.worker.run()
 
 
