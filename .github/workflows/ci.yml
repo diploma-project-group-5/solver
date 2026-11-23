@@ -10,24 +10,51 @@ permissions:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # Superseded PR pushes are cancelled; runs on develop/main always finish.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   checks:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7, resolved 2026-11-08
         with:
           fetch-depth: 0  # gitleaks scans the history
+          persist-credentials: false  # no GITHUB_TOKEN in .git/config (it is mounted into gitleaks)
 
-      - uses: astral-sh/setup-uv@v10.3.3
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
         with:
           version: "0.13.7"
           enable-cache: true
 
       - name: Install (locked)
         run: uv sync --locked
+
+      # Golden checks (tests/golden.py) send every result through the validator-lib CLI: the
+      # timetable rules live there only (Trello #73). Pinned to the commit of a release tag (a tag can
+      # be moved) and built with npm ci, so transitive dependencies come from its lockfile.
+      # Bump the commit together with a validator-lib release the solver must agree with.
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38  # v6.5.0, resolved 2026-11-14
+        with:
+          node-version: "24"
+
+      - name: Check out validator-lib
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7, resolved 2026-11-08
+        with:
+          repository: diploma-project-group-5/validator-lib
+          ref: d4952fc4a91d49a1557585853872bb42e3e54744  # tag v0.4.0 (--mode new-conflicts)
+          path: _validator
+          persist-credentials: false
+
+      - name: Build validator-lib CLI (locked)
+        working-directory: _validator
+        run: |
+          # The lockfile records the public @lad/contracts git dependency as ssh: fetch it over https.
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          npm ci --no-audit --no-fund  # prepare builds dist/
+          node dist/cli/main.js --version
+          echo "LAD_VALIDATE_CLI=$PWD/dist/cli/main.js" >> "$GITHUB_ENV"
 
       - name: Format
         run: uv run ruff format --check .
@@ -38,27 +65,33 @@ jobs:
       - name: Type check
         run: uv run pyright
 
-      # Contract conformance (schemas, topic manifest, job-lifecycle vectors) runs against a pinned
-      # contracts commit. Bump CONTRACTS_REF together with any change to the solver's events.
-      # Currently: contracts PR #1 (feat/23-solve-event-contracts); move to the merge commit once merged.
+      # Contract conformance (schemas, topic manifest, job-lifecycle and substitution-solve vectors,
+      # the week vectors of the golden substitution check) runs against a pinned contracts commit.
+      # Bump the ref together with any change to the solver's events.
       - name: Check out contracts
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7, resolved 2026-11-08
         with:
           repository: diploma-project-group-5/contracts
-          ref: 45248891bc3cdefcfb370bc28983bcfda69525c4
+          ref: 5c0f3dd299dabc6fccd3c675f19e0a199718c640  # tag v0.5.0
           path: _contracts
+          persist-credentials: false
 
       - name: Unit and contract tests
         env:
           LAD_CONTRACTS_DIR: ${{ github.workspace }}/_contracts
-        run: uv run pytest -m "not integration" --cov --cov-report=term-missing
+        # tests/realistic runs in its own job (minutes of CP-SAT time, see the scenarios job).
+        run: uv run pytest -m "not integration" --ignore=tests/realistic --cov --cov-report=term-missing
 
       - name: Dependency audit
-        run: uv export --locked --no-dev --no-hashes --no-emit-project --format requirements-txt | uvx pip-audit --strict -r /dev/stdin
+        # The worker extra ships in the image (confluent-kafka, pydantic), so it is audited too.
+        run: |
+          uv export --locked --no-dev --extra worker --no-emit-project --format requirements-txt \
+            > "$RUNNER_TEMP/req.txt"
+          uvx pip-audit --strict --require-hashes --disable-pip -r "$RUNNER_TEMP/req.txt"
 
       - name: Secret scan
         run: |
-          docker run --rm -v "$PWD:/repo" ghcr.io/gitleaks/gitleaks:v8.30.1 \
+          docker run --rm -v "$PWD:/repo:ro" ghcr.io/gitleaks/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f \
             git /repo --redact --no-banner --exit-code 1
 
   integration:
@@ -66,9 +99,11 @@ jobs:
     runs-on: ubuntu-24.04  # Docker is available for testcontainers (apache/kafka, KRaft)
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7, resolved 2026-11-08
+        with:
+          persist-credentials: false
 
-      - uses: astral-sh/setup-uv@v10.3.3
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
         with:
           version: "0.13.7"
           enable-cache: true
@@ -77,16 +112,71 @@ jobs:
         run: uv sync --locked
 
       - name: Integration tests (Kafka in testcontainers)
-        run: uv run pytest -m integration
+        # The image test runs in the image job, against the image built there.
+        run: uv run pytest -m "integration and not image"
+
+  scenarios:
+    needs: checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7, resolved 2026-11-08
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
+        with:
+          version: "0.13.7"
+          enable-cache: true
+
+      - name: Install (locked)
+        run: uv sync --locked
+
+      # Golden checks (tests/golden.py) send every result through the validator-lib CLI: the
+      # timetable rules live there only (Trello #73). Pinned to the commit of a release tag (a tag can
+      # be moved) and built with npm ci, so transitive dependencies come from its lockfile.
+      # Bump the commit together with a validator-lib release the solver must agree with.
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38  # v6.5.0, resolved 2026-11-14
+        with:
+          node-version: "24"
+
+      - name: Check out validator-lib
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7, resolved 2026-11-08
+        with:
+          repository: diploma-project-group-5/validator-lib
+          ref: d4952fc4a91d49a1557585853872bb42e3e54744  # tag v0.4.0 (--mode new-conflicts)
+          path: _validator
+          persist-credentials: false
+
+      - name: Build validator-lib CLI (locked)
+        working-directory: _validator
+        run: |
+          # The lockfile records the public @lad/contracts git dependency as ssh: fetch it over https.
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          npm ci --no-audit --no-fund  # prepare builds dist/
+          node dist/cli/main.js --version
+          echo "LAD_VALIDATE_CLI=$PWD/dist/cli/main.js" >> "$GITHUB_ENV"
+
+      - name: Realistic school scenarios
+        run: uv run pytest tests/realistic -m ""
 
   image:
     needs: checks
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7, resolved 2026-11-08
+        with:
+          persist-credentials: false
       - name: Build image
         run: docker build --tag lad-solver:${{ github.sha }} .
+
+      # Fixable HIGH/CRITICAL vulnerabilities in the image (OS packages and Python) fail the build.
+      - name: Scan image (trivy)
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy:0.76.1@sha256:790fd66d1697395d8693d1acaa1ea702406a20f109b6fc7bac8db623eca6c06c \
+            image --quiet --severity CRITICAL,HIGH --ignore-unfixed --exit-code 1 lad-solver:${{ github.sha }}
       # The default command is the Kafka worker, which needs a broker; smoke-test the CLI instead.
       - name: Smoke-run image
         run: |
@@ -94,4 +184,18 @@ jobs:
           docker run --rm --entrypoint sh lad-solver:${{ github.sha }} -c \
             'lad-solver generate --classes 3 --shelter-ratio 0.5 --out /tmp/p.json &&
              lad-solver solve --in /tmp/p.json --out /tmp/r.json --time-limit 5 --workers 1'
+
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
+        with:
+          version: "0.13.7"
+          enable-cache: true
+
+      - name: Install (locked)
+        run: uv sync --locked
+
+      # docker stop mid-solve on this image with init (tini): best timetable, exit 0 (Trello #73).
+      - name: SIGTERM on the built image
+        env:
+          SOLVER_TEST_IMAGE: lad-solver:${{ github.sha }}
+        run: uv run pytest -m image
 

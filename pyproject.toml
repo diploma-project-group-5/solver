@@ -1,6 +1,6 @@
 [project]
 name = "lad-solver"
-version = "0.1.0"
+version = "0.4.0"
 description = "Lad timetable solver: CP-SAT worker for main/alert timetables and substitutions, plus the bench CLI."
 authors = [{ name = "Roman Osovyk", email = "r.osovyk@gmail.com" }]
 readme = "README.md"
@@ -32,7 +32,7 @@ dev = [
     "pytest>=9.2",
     "pytest-cov>=7.1",
     "ruff>=0.17.3",
-    "testcontainers[kafka]>=4.15.0",
+    "testcontainers>=4.15.0",
 ]
 
 [build-system]
@@ -92,6 +92,7 @@ filterwarnings = ["error"]
 markers = [
     "integration: needs Docker (Kafka/testcontainers); excluded from the default fast run",
     "slow: long-running test (seconds or more); deselect with -m 'not slow'",
+    "image: runs the built solver image (Docker); SOLVER_TEST_IMAGE or a local build",
 ]
 
 # ---------------------------------------------------------------- coverage

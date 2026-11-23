@@ -309,7 +309,7 @@ wheels = [
 
 [[package]]
 name = "lad-solver"
-version = "0.1.0"
+version = "0.4.0"
 source = { editable = "." }
 dependencies = [
     { name = "ortools" },
@@ -350,7 +350,7 @@ dev = [
     { name = "pytest", specifier = ">=9.2" },
     { name = "pytest-cov", specifier = ">=7.1" },
     { name = "ruff", specifier = ">=0.17.3" },
-    { name = "testcontainers", extras = ["kafka"], specifier = ">=4.15.0" },
+    { name = "testcontainers", specifier = ">=4.15.0" },
 ]
 
 [[package]]

@@ -6,6 +6,12 @@ from typing import Protocol
 
 from lad_solver.domain.problem import Params, Problem
 from lad_solver.domain.result import Result
+from lad_solver.domain.substitution import (
+    SubstitutionParams,
+    SubstitutionRequest,
+    SubstitutionResult,
+)
+from lad_solver.model.progress import Progress
 from lad_solver.model.stop import StopHandle
 
 
@@ -66,4 +72,9 @@ class ProducerPort(Protocol):
         ...
 
 
-type Engine = Callable[[Problem, Params, StopHandle], Result]
+# progress: phase A telemetry + the no-improvement stop, ticked by the worker's wait loop.
+type Engine = Callable[[Problem, Params, StopHandle, Progress], Result]
+# The substitution engine (stage 2): no progress, the steps are small deterministic models.
+type SubstitutionEngine = Callable[
+    [SubstitutionRequest, SubstitutionParams, StopHandle], SubstitutionResult
+]

@@ -6,16 +6,28 @@ unit-tested here without Kafka.
 
 import hashlib
 import json
+import math
 import re
-from collections.abc import Iterator
-from dataclasses import dataclass
+from collections.abc import Callable, Iterator, Sequence
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
+from functools import cache
 from types import UnionType
-from typing import Annotated, Final, TypeAliasType, Union, get_args, get_origin
+from typing import (
+    Annotated,
+    Any,
+    Final,
+    Protocol,
+    TypeAliasType,
+    Union,
+    cast,
+    get_args,
+    get_origin,
+)
 from uuid import UUID, uuid5
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError
 
 from lad_solver import __version__
 from lad_solver.adapters.kafka.payload import (
@@ -25,11 +37,21 @@ from lad_solver.adapters.kafka.payload import (
     AlertCapacity,
     BuildRequested,
     BuildRequestedData,
+    ClassIn,
     EnvelopeHead,
+    Id,
+    PassportCapacity,
+    RowIn,
+    SubjectIn,
+    SubstitutionHead,
+    SubstitutionRequested,
+    SubstitutionRequestedData,
+    TeacherIn,
 )
 from lad_solver.adapters.kafka.ports import InboundMessage, OutboundMessage
 from lad_solver.domain.problem import (
     AlertLimits,
+    Capacity,
     CurriculumRow,
     Params,
     Passport,
@@ -39,16 +61,36 @@ from lad_solver.domain.problem import (
     Teacher,
     TimetableKind,
 )
-from lad_solver.domain.result import Result, SolveStatus
+from lad_solver.domain.result import DayFormat, Lesson, Result, SolveStatus
+from lad_solver.domain.substitution import (
+    Absence,
+    Hour,
+    InvalidRequestError,
+    Overlay,
+    OverlayKind,
+    Proposal,
+    ProposalKind,
+    Slot,
+    SubstitutionParams,
+    SubstitutionRequest,
+    SubstitutionResult,
+    baseline_week,
+    iso_week_dates,
+)
 
 BUILD_REQUESTED: Final = "solve.build.requested"
+SUBSTITUTION_REQUESTED: Final = "solve.substitution.requested"
 STARTED: Final = "solve.started"
 COMPLETED: Final = "solve.completed"
 SCHEMA_VERSION: Final = "1.0"
 SUPPORTED_MAJOR: Final = 1
 SOURCE: Final = "solver"
-# Formulation of the CP-SAT model (ADR 2026-11-04 §1: phase A by days + phase B per day).
-MODEL_VERSION: Final = "a+b/2026-11-04"
+# Formulation of the CP-SAT models: phase A by days (a), its coverage step (a2), phase B per day
+# (b) (ADR 2026-11-04 §1, 2026-11-14) and the substitution steps 1-3 (s, ADR 2026-11-15-solver-
+# substitution-engine); the date is the last change of any of them.
+MODEL_VERSION: Final = "a+a2+b+s/2026-11-15"
+# solve.status substitution.proposals.maxItems (a static bound: one teacher's day is <= 10 rows).
+MAX_PROPOSALS: Final = 600
 
 # Fixed namespace: a re-sent event keeps its event_id, so timetable's inbox drops the duplicate.
 EVENT_NAMESPACE: Final = UUID("5a0c6f2e-9d1b-4c3a-8e7f-6b5d4c3a2e1f")
@@ -57,10 +99,17 @@ _MODEL_FOR_KIND: Final = {"main": "1.1", "alert": "1.2"}
 
 
 class ErrorCode(StrEnum):
+    """The codes this solver sends. The contract also keeps ``unsupported_job_type``: solvers
+    before 0.4.0 refused substitutions with it, and future job types may (ADR 2026-11-15)."""
+
     INVALID_PAYLOAD = "invalid_payload"
     UNSUPPORTED_SCHEMA_VERSION = "unsupported_schema_version"
     RESULT_TOO_LARGE = "result_too_large"
     INTERNAL = "internal"
+
+
+# Errors caused by the request itself: the answer names the invalid_input rule in conflicts.
+_INPUT_ERRORS: Final = frozenset({ErrorCode.INVALID_PAYLOAD, ErrorCode.UNSUPPORTED_SCHEMA_VERSION})
 
 
 class InvalidInputError(ValueError):
@@ -89,15 +138,22 @@ class Poison:
 
 @dataclass(frozen=True, slots=True)
 class Rejected:
-    """A job that is answered with MODEL_INVALID without solving (one attempt, no retries)."""
+    """A job that is answered with MODEL_INVALID without solving (one attempt, no retries).
+
+    ``reason`` names the broken rule for the logs and the DLQ header: a fixed literal, or a
+    pydantic error type with its field path (names and indices, never input values).
+    """
 
     address: Address
     code: ErrorCode
     error_class: str
+    reason: str | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
 class Accepted:
+    """A build job to solve."""
+
     address: Address
     data: BuildRequestedData
     problem: Problem
@@ -109,7 +165,23 @@ class Accepted:
         return self.data.queue_deadline_at
 
 
-type ParseOutcome = Poison | Rejected | Accepted
+@dataclass(frozen=True, slots=True)
+class SubstitutionAccepted:
+    """A substitution job to solve: the request is consistent (its baseline week builds)."""
+
+    address: Address
+    data: SubstitutionRequestedData
+    request: SubstitutionRequest
+    input_sha256: str
+    requested_at: datetime | None
+    ignored_fields: int = 0  # keys of ``data`` the contract does not know (logged as a count)
+
+    @property
+    def queue_deadline_at(self) -> datetime:
+        return self.data.queue_deadline_at
+
+
+type ParseOutcome = Poison | Rejected | Accepted | SubstitutionAccepted
 
 
 def event_id(job_id: UUID, event_type: str) -> UUID:
@@ -119,9 +191,18 @@ def event_id(job_id: UUID, event_type: str) -> UUID:
 # ---------------------------------------------------------------- inbound
 
 
+_MAX_INT_CHARS: Final = 64  # far beyond any int64; json would refuse > 4300 digits outright
+
+
+def _parse_int(literal: str) -> int | str:
+    """A huge JSON integer stays a string, so validation rejects it as out of range instead of
+    json.loads failing (which would make a valid, addressable job look like non-JSON)."""
+    return int(literal) if len(literal) <= _MAX_INT_CHARS else literal
+
+
 def _load(raw: bytes | None) -> dict[str, object] | Poison:
     try:
-        document: object = json.loads(raw) if raw is not None else None
+        document: object = json.loads(raw, parse_int=_parse_int) if raw is not None else None
     except ValueError, RecursionError:
         return Poison("not_json")
     if not isinstance(document, dict):
@@ -167,17 +248,20 @@ def address_of(raw: bytes | None) -> Address | None:
         return None
 
 
-def _envelope_rejection(document: dict[str, object]) -> tuple[ErrorCode, str] | None:
+def _envelope_rejection(
+    document: dict[str, object], expected_type: str
+) -> tuple[ErrorCode, str] | None:
     version = document.get("schema_version")
     if not isinstance(version, str) or _SCHEMA_VERSION.fullmatch(version) is None:
         return ErrorCode.INVALID_PAYLOAD, "schema_version"
-    if int(version.split(".", 1)[0]) != SUPPORTED_MAJOR:
+    # A string compare is exact (the pattern forbids leading zeros) and never parses a huge int.
+    if version.split(".", 1)[0] != str(SUPPORTED_MAJOR):
         return ErrorCode.UNSUPPORTED_SCHEMA_VERSION, "schema_version"
     try:
         head = EnvelopeHead.model_validate(document)
     except ValidationError:
         return ErrorCode.INVALID_PAYLOAD, "invalid_envelope"
-    if head.type != BUILD_REQUESTED:
+    if head.type != expected_type:
         return ErrorCode.INVALID_PAYLOAD, "unexpected_type"
     return None
 
@@ -194,21 +278,65 @@ def parse_build_request(raw: bytes | None) -> ParseOutcome:
     address = _address(document)
     if address is None:
         return Poison("invalid_envelope")
-    rejection = _envelope_rejection(document)
-    if rejection is None:
-        try:
-            event = BuildRequested.model_validate(document)
-            problem = to_problem(event.data)
-            digest = input_sha256(event.data)  # encodes every validated string
-        except ValidationError:
-            rejection = (ErrorCode.INVALID_PAYLOAD, "validation")
-        except InvalidInputError:
-            rejection = (ErrorCode.INVALID_PAYLOAD, "referential_integrity")
-        except UnicodeEncodeError:
-            rejection = (ErrorCode.INVALID_PAYLOAD, "invalid_unicode")
-        else:
-            return Accepted(address, event.data, problem, digest, event.time)
-    return Rejected(address, *rejection)
+    rejection = _envelope_rejection(document, BUILD_REQUESTED)
+    if rejection is not None:
+        return Rejected(address, *rejection)
+
+    def accept() -> Accepted:
+        event = BuildRequested.model_validate(document)
+        problem = to_problem(event.data)
+        digest = input_sha256(event.data)  # encodes every validated string
+        return Accepted(address, event.data, problem, digest, event.time)
+
+    return _checked(address, accept)
+
+
+def _checked[T](address: Address, accept: Callable[[], T]) -> T | Rejected:
+    """Validate a payload; each failure becomes the job's invalid_payload answer with a reason."""
+    try:
+        return accept()
+    except ValidationError as exc:
+        return Rejected(address, ErrorCode.INVALID_PAYLOAD, "validation", _validation_reason(exc))
+    except (InvalidInputError, InvalidRequestError) as exc:
+        return Rejected(address, ErrorCode.INVALID_PAYLOAD, "referential_integrity", str(exc))
+    except UnicodeEncodeError:
+        return Rejected(address, ErrorCode.INVALID_PAYLOAD, "invalid_unicode")
+
+
+def parse_substitution_request(raw: bytes | None) -> Poison | Rejected | SubstitutionAccepted:
+    """Classify a substitution job as a build job is classified (contracts 0.5.0).
+
+    The request must describe one consistent week (``baseline_week``, the one gate) before
+    ``solve.started`` is promised; otherwise the job is answered with invalid_payload.
+    """
+    document = _load(raw)
+    if isinstance(document, Poison):
+        return document
+    address = _address(document)
+    if address is None:
+        return Poison("invalid_envelope")
+    rejection = _envelope_rejection(document, SUBSTITUTION_REQUESTED)
+    if rejection is not None:
+        return Rejected(address, *rejection)
+
+    def accept() -> SubstitutionAccepted:
+        event = SubstitutionRequested.model_validate(document)
+        request = to_substitution(event.data)
+        baseline_week(request)
+        digest = input_sha256(event.data)
+        data = cast("dict[str, object]", document["data"])  # an object: the model validated it
+        ignored = sum(1 for key in data if key not in SubstitutionRequestedData.model_fields)
+        return SubstitutionAccepted(address, event.data, request, digest, event.time, ignored)
+
+    return _checked(address, accept)
+
+
+def _validation_reason(exc: ValidationError) -> str:
+    """The first error as "type at a.b.0": field names and indices, never input values (every
+    payload field is declared and unknown keys are ignored, so a path never quotes input)."""
+    [first, *_] = exc.errors(include_url=False, include_input=False, include_context=False)
+    path = ".".join(str(part) for part in first["loc"])
+    return f"{first['type']} at {path}"[:200]
 
 
 def _unique(kind: str, ids: list[str]) -> set[str]:
@@ -223,8 +351,34 @@ def to_problem(data: BuildRequestedData) -> Problem:
     if _MODEL_FOR_KIND[data.kind] != data.model:
         msg = "model does not match kind"
         raise InvalidInputError(msg)
+    return _school(data, TimetableKind(data.kind))
+
+
+class _Snapshot(Protocol):
+    """The snapshot fields that build and substitution requests share."""
+
+    @property
+    def school_days(self) -> tuple[int, ...]: ...
+    @property
+    def lessons_per_day(self) -> int: ...
+    @property
+    def staff(self) -> int: ...
+    @property
+    def capacity(self) -> AlertCapacity | PassportCapacity: ...
+    @property
+    def classes(self) -> tuple[ClassIn, ...]: ...
+    @property
+    def subjects(self) -> tuple[SubjectIn, ...]: ...
+    @property
+    def teachers(self) -> tuple[TeacherIn, ...]: ...
+    @property
+    def rows(self) -> tuple[RowIn, ...]: ...
+
+
+def _school(data: _Snapshot, kind: TimetableKind) -> Problem:
+    """The snapshot as a ``Problem``; ids are unique and every curriculum row resolves."""
     is_alert_capacity = isinstance(data.capacity, AlertCapacity)
-    if is_alert_capacity != (data.kind == "alert"):
+    if is_alert_capacity != (kind is TimetableKind.ALERT):
         msg = "capacity shape does not match kind"
         raise InvalidInputError(msg)
 
@@ -239,19 +393,14 @@ def to_problem(data: BuildRequestedData) -> Problem:
         ):
             msg = "curriculum row references an unknown id"
             raise InvalidInputError(msg)
-    _unique("row", [f"{r.class_id}\x00{r.subject_id}\x00{r.teacher_id}" for r in data.rows])
-
-    capacity = (
-        AlertLimits(seats=data.capacity.seats, passport=data.capacity.passport)
-        if isinstance(data.capacity, AlertCapacity)
-        else Passport(passport=data.capacity.passport)
-    )
+    # One teacher per class x subject (spec), as validator-lib duplicate_row: no teacher in key.
+    _unique("row", [f"{r.class_id}\x00{r.subject_id}" for r in data.rows])
     return Problem(
-        kind=TimetableKind(data.kind),
+        kind=kind,
         school_days=data.school_days,
         lessons_per_day=data.lessons_per_day,
         staff=data.staff,
-        capacity=capacity,
+        capacity=_capacity(data.capacity),
         classes=tuple(SchoolClass(c.id, c.students, c.priority) for c in data.classes),
         subjects=tuple(Subject(s.id, s.priority_area, s.no_shelter) for s in data.subjects),
         teachers=tuple(
@@ -263,10 +412,67 @@ def to_problem(data: BuildRequestedData) -> Problem:
     )
 
 
+def _capacity(capacity: AlertCapacity | PassportCapacity) -> Capacity:
+    if isinstance(capacity, AlertCapacity):
+        return AlertLimits(seats=capacity.seats, passport=capacity.passport)
+    return Passport(passport=capacity.passport)
+
+
+def to_substitution(data: SubstitutionRequestedData) -> SubstitutionRequest:
+    """The request as engine input; ``baseline_week`` then checks that it is one coherent week.
+
+    Only the snapshot must be closed (unique ids, rows that resolve): the template and the
+    approved substitutions may name ids that left the snapshot (an archived class, a deleted
+    teacher), which validator-lib reports as conflicts the week already has.
+    """
+    school = _school(data, TimetableKind(data.template.kind))
+    if data.date not in iso_week_dates(data.iso_week):
+        msg = "the date is not in iso_week"
+        raise InvalidInputError(msg)
+    return SubstitutionRequest(
+        school=school,
+        date=data.date,
+        absent_teacher_id=data.absent_teacher_id,
+        lessons=tuple(Slot(data.date, x.class_id, x.lesson_no) for x in data.lessons),
+        not_before=data.not_before,
+        absence_dates=frozenset(data.absence_dates),
+        template_lessons=tuple(
+            Lesson(x.class_id, x.day, x.lesson_no, x.subject_id, x.teacher_id)
+            for x in data.template.lessons
+        ),
+        template_formats=tuple(
+            DayFormat(f.class_id, f.day, f.in_person) for f in data.template.day_formats
+        ),
+        approved=tuple(
+            Overlay(
+                Slot(a.date, a.class_id, a.lesson_no),
+                OverlayKind(a.kind),
+                a.teacher_id,
+                None if a.moved_to is None else Hour(a.moved_to.date, a.moved_to.lesson_no),
+            )
+            for a in data.approved_substitutions
+        ),
+        absences=None
+        if data.absences is None
+        else tuple(
+            Absence(
+                a.teacher_id,
+                a.date,
+                None if a.lesson_nos is None else frozenset(a.lesson_nos),
+            )
+            for a in data.absences
+        ),
+        non_school_dates=None
+        if data.non_school_dates is None
+        else frozenset(data.non_school_dates),
+        allow_support_moves=data.allow_support_moves,
+    )
+
+
 _NOT_PART_OF_INPUT: Final = frozenset({"job_id", "queue_deadline_at", "time_limit_s"})
 
 
-def input_sha256(data: BuildRequestedData) -> str:
+def input_sha256(data: BuildRequestedData | SubstitutionRequestedData) -> str:
     """Hash of the problem itself (not of the job), so bench can match a request to its input."""
     canonical = data.model_dump(mode="json", exclude=set(_NOT_PART_OF_INPUT))
     encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
@@ -281,17 +487,42 @@ def params_for(  # noqa: PLR0913 -- keyword-only server-side knobs
     num_workers: int,
     seed: int,
     max_memory_mb: int | None = None,
+    stall_min_s: float = 0.0,
+    stall_ratio: float = 1.0,
 ) -> Params:
-    """Server-side bounds: the requested limit is clamped, clients never pick solver knobs.
-
-    The only clamp of the time limit in production code.
-    """
-    limit = max(min_time_limit_s, min(max_time_limit_s, data.time_limit_s))
+    """Server-side bounds: the requested limit is clamped, clients never pick solver knobs."""
+    limit = clamp_time_limit(data.time_limit_s, min_time_limit_s, max_time_limit_s)
     return Params(
         time_limit_s=float(limit),
         num_workers=num_workers,
         random_seed=seed,
         max_memory_mb=max_memory_mb,
+        stall_min_s=stall_min_s or None,
+        stall_ratio=stall_ratio,
+    )
+
+
+def clamp_time_limit(requested: int, min_time_limit_s: int, max_time_limit_s: int) -> int:
+    """The only clamp of the time limit in production code (contracts README item 5)."""
+    return max(min_time_limit_s, min(max_time_limit_s, requested))
+
+
+# The ADR fixes the substitution search: one worker and random_seed 0, whatever SOLVER_SEED says
+# (that knob is for builds), so a substitution answer never depends on the deployment.
+SUBSTITUTION_SEED: Final = 0
+
+
+def substitution_params(
+    data: SubstitutionRequestedData,
+    *,
+    min_time_limit_s: int,
+    max_time_limit_s: int,
+    max_memory_mb: int | None = None,
+) -> SubstitutionParams:
+    """One worker, seed 0 and a budget of ``time_limit_s`` deterministic seconds (ADR)."""
+    limit = clamp_time_limit(data.time_limit_s, min_time_limit_s, max_time_limit_s)
+    return SubstitutionParams(
+        time_limit_s=float(limit), random_seed=SUBSTITUTION_SEED, max_memory_mb=max_memory_mb
     )
 
 
@@ -388,9 +619,62 @@ def completed_data(
     return data
 
 
+def _proposal(p: Proposal) -> dict[str, object]:
+    row: dict[str, object] = {
+        "date": p.slot.date.isoformat(),
+        "class_id": p.slot.class_id,
+        "lesson_no": p.slot.lesson_no,
+        "kind": p.kind.value,
+    }
+    match p.kind:
+        case ProposalKind.TEACHER:
+            row |= {"teacher_id": p.teacher_id, "off_profile": p.off_profile}
+        case ProposalKind.MOVED:
+            assert p.moved_to is not None  # noqa: S101 -- the engine sets it for moved rows
+            row["moved_to"] = {
+                "date": p.moved_to.date.isoformat(),
+                "lesson_no": p.moved_to.lesson_no,
+            }
+        case ProposalKind.SELF_STUDY:
+            pass
+    row["step"] = p.step
+    return row
+
+
+def substitution_data(
+    job_id: UUID, result: SubstitutionResult, provenance: Provenance | None
+) -> dict[str, object]:
+    """``solve.completed`` of a substitution: no timetable, no conflicts (contracts 0.5.0)."""
+    if len(result.proposals) > MAX_PROPOSALS:
+        return rejected_data(job_id, ErrorCode.RESULT_TOO_LARGE)
+    data: dict[str, object] = {
+        "job_id": str(job_id),
+        "status": result.status.value,
+        "lessons": [],
+        "day_formats": [],
+        "conflicts": [],
+        "substitution": {
+            "step": result.step,
+            "proposals": [_proposal(p) for p in result.proposals],
+        },
+    }
+    if provenance is not None:
+        stats = result.stats
+        data["stats"] = {
+            "wall_time_ms": provenance.wall_time_ms,
+            "num_workers": stats.num_workers,
+            "random_seed": stats.random_seed,
+            "solver_version": __version__,
+            "model_version": MODEL_VERSION,
+            "input_sha256": provenance.input_sha256,
+            "stop_reason": stats.stop_reason.value,
+        }
+    return data
+
+
 def rejected_data(job_id: UUID, code: ErrorCode) -> dict[str, object]:
     data = completed_data(job_id, Result(status=SolveStatus.MODEL_INVALID), None)
-    data["conflicts"] = [{"rule": "invalid_input"}] if code is not ErrorCode.INTERNAL else []
+    data["conflicts"] = [{"rule": "invalid_input"}] if code in _INPUT_ERRORS else []
     data["error"] = {"code": code.value}
     return data
 
@@ -417,7 +701,6 @@ def completed_message(
     code = ErrorCode(error["code"]) if isinstance(error, dict) else None
     if len(value) > max_bytes:
         too_large = rejected_data(address.job_id, ErrorCode.RESULT_TOO_LARGE)
-        too_large["conflicts"] = []
         value = _envelope(address, COMPLETED, too_large, now)
         status, code = SolveStatus.MODEL_INVALID.value, ErrorCode.RESULT_TOO_LARGE
     return Completed(OutboundMessage(topic, address.key, value), status, code)
@@ -446,15 +729,63 @@ def _redacted(value: object) -> str:
     return f"<redacted:{type(value).__name__}>"
 
 
+def _is_scalar(item: object) -> bool:
+    if isinstance(item, float):
+        return math.isfinite(item)  # NaN / Infinity would make the DLQ copy invalid JSON
+    return isinstance(item, (bool, int, str))
+
+
 def _is_plain(item: object) -> bool:
     """A JSON scalar or a flat list of scalars (e.g. unavailable_days)."""
-    scalar = (bool, int, float, str)
-    if item is None or isinstance(item, scalar):
+    if item is None or _is_scalar(item):
         return True
     if isinstance(item, list):
         items: list[object] = item  # pyright: ignore[reportUnknownVariableType]
-        return all(isinstance(x, scalar) for x in items)
+        return all(_is_scalar(x) for x in items)
     return False
+
+
+_LEAF_CONFIG: Final = ConfigDict(hide_input_in_errors=True)
+
+
+def _annotated(model: type[BaseModel], name: str) -> object:
+    info = model.model_fields[name]
+    return Annotated[info.annotation, *info.metadata] if info.metadata else info.annotation
+
+
+# Free-text envelope fields of inbound events are checked as strictly as the envelope reader does;
+# ``source`` has no contract format, so it is kept only when it looks like an identifier.
+_ENVELOPE_LEAVES: Final[dict[str, object]] = {
+    "schema_version": _annotated(EnvelopeHead, "schema_version"),
+    "correlation_id": _annotated(EnvelopeHead, "correlation_id"),
+    "source": Id | None,
+}
+
+
+_ENVELOPE_MODELS: Final = frozenset({BuildRequested, SubstitutionHead})
+
+# DLQ projections per consumed topic: a field outside these models never reaches the DLQ copy.
+BUILD_DLQ_MODELS: Final[tuple[type[BaseModel], ...]] = (BuildRequested,)
+SUBSTITUTION_DLQ_MODELS: Final[tuple[type[BaseModel], ...]] = (SubstitutionHead,)
+
+
+@cache
+def _leaf_adapter(model: type[BaseModel], name: str) -> TypeAdapter[Any]:
+    override = _ENVELOPE_LEAVES.get(name) if model in _ENVELOPE_MODELS else None
+    annotation: Any = override or _annotated(model, name)  # a type form built at runtime
+    return TypeAdapter[Any](annotation, config=_LEAF_CONFIG)
+
+
+def _leaf(model: type[BaseModel], name: str, item: object) -> object:
+    """A contract leaf is copied only when it is a valid value of that field: a field name alone
+    does not make its value safe (a signature typed into ``teachers[].id`` stays out)."""
+    if not _is_plain(item):
+        return _redacted(item)
+    try:
+        _leaf_adapter(model, name).validate_python(item)
+    except ValidationError:
+        return _redacted(item)
+    return item
 
 
 MAX_DLQ_DEPTH: Final = 16  # the contract nests at most 4 levels; deeper input is redacted
@@ -483,29 +814,65 @@ def _project(value: object, models: list[type[BaseModel]], depth: int = 0) -> ob
             if nested:
                 projected[name] = _project(item, nested, depth + 1)
             else:
-                projected[name] = item if _is_plain(item) else _redacted(item)
+                projected[name] = _leaf(model, name, item)
     return projected
 
 
-def dlq_value(raw: bytes | None) -> bytes | None:
+MAX_DLQ_PROJECTION_BYTES: Final = 512 * 1024  # the DLQ copy must stay below the 1 MB limit
+
+
+def _minimal(projected: object) -> dict[str, object]:
+    """Envelope scalars and the job id only, for a projection too large to produce."""
+    if not isinstance(projected, dict):
+        return {}
+    document: dict[str, object] = projected  # pyright: ignore[reportUnknownVariableType]
+    head: dict[str, object] = {
+        key: value for key, value in document.items() if not isinstance(value, (dict, list))
+    }
+    data = document.get("data")
+    if isinstance(data, dict) and "job_id" in data:
+        head["data"] = {"job_id": data["job_id"]}
+    return head
+
+
+def _dump(document: dict[str, object]) -> bytes:
+    # ASCII escapes: a lone surrogate from the input must not break the diagnostic copy.
+    return json.dumps(document, ensure_ascii=True, separators=(",", ":"), allow_nan=False).encode()
+
+
+def dlq_value(raw: bytes | None, models: Sequence[type[BaseModel]]) -> bytes | None:
     """DLQ copy for diagnostics. JSON is projected onto the contract's fields, so personal data
-    added by mistake does not live on in the DLQ for 14 days; non-JSON is kept as raw bytes."""
+    added by mistake does not live on in the DLQ for 14 days. Bytes that are not JSON (truncated,
+    wrong encoding) cannot be projected, so only their size and SHA-256 are kept."""
     if raw is None:
         return None
     try:
-        document: object = json.loads(raw)
+        document: object = json.loads(raw, parse_int=_parse_int)
     except ValueError, RecursionError:
-        return raw
-    # ASCII escapes: a lone surrogate from the input must not break the diagnostic copy.
-    projected = {"projected": _project(document, [BuildRequested])}
-    return json.dumps(projected, ensure_ascii=True, separators=(",", ":")).encode()
+        return _dump(
+            {"unparseable": True, "size_bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
+        )
+    projected = _project(document, list(models))
+    value = _dump({"projected": projected})
+    if len(value) > MAX_DLQ_PROJECTION_BYTES:
+        value = _dump({"projected": _minimal(projected), "truncated": True})
+    return value
 
 
-def dlq_message(message: InboundMessage, *, topic: str, error_class: str) -> OutboundMessage:
+def dlq_message(
+    message: InboundMessage,
+    *,
+    topic: str,
+    error_class: str,
+    models: Sequence[type[BaseModel]],
+    reason: str | None = None,
+) -> OutboundMessage:
+    """``reason``: the rule a rejected request broke (a fixed literal or a field path)."""
     headers = (
         ("x-error-class", error_class.encode()),
         ("x-original-topic", message.topic.encode()),
         ("x-original-partition", str(message.partition).encode()),
         ("x-original-offset", str(message.offset).encode()),
+        *((("x-error-reason", reason.encode()),) if reason is not None else ()),
     )
-    return OutboundMessage(topic, message.key, dlq_value(message.value), headers)
+    return OutboundMessage(topic, message.key, dlq_value(message.value, models), headers)

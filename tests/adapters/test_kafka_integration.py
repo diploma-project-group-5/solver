@@ -5,6 +5,7 @@ platform runs) is started as a generic container: the advertised listener must e
 port, hence a fixed free port chosen up front. Waits are deadline-bounded polls, never sleeps.
 """
 
+import hashlib
 import json
 import os
 import signal
@@ -16,6 +17,7 @@ import time
 import uuid
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -26,16 +28,20 @@ from kafka_support import (
     FakeEngine,
     Journal,
     Json,
+    ReferenceJob,
     build_request,
     encode,
+    instant,
+    substitution_request,
 )
 from testcontainers.core.container import DockerContainer
 
 from lad_solver.adapters.kafka.config import WorkerConfig
 from lad_solver.adapters.kafka.kafka_io import KafkaConsumer, KafkaProducer
-from lad_solver.adapters.kafka.ports import Engine
+from lad_solver.adapters.kafka.ports import Engine, SubstitutionEngine
 from lad_solver.adapters.kafka.worker import Worker
 from lad_solver.app.solve import solve
+from lad_solver.app.substitute import substitute
 
 pytestmark = pytest.mark.integration
 
@@ -100,6 +106,8 @@ class Topics:
     status: str
     dlq: str
     group: str
+    substitution: str
+    substitution_dlq: str
 
 
 @pytest.fixture
@@ -110,12 +118,20 @@ def topics(bootstrap: str) -> Topics:
         f"solve.status.{suffix}",
         f"solve.build.requested.{suffix}.dlq",
         f"lad-solver-{suffix}",
+        f"solve.substitution.requested.{suffix}",
+        f"solve.substitution.requested.{suffix}.dlq",
     )
     admin = AdminClient({"bootstrap.servers": bootstrap})
     futures = admin.create_topics(  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
         [
             NewTopic(name, num_partitions=1, replication_factor=1)
-            for name in (names.build, names.status, names.dlq)
+            for name in (
+                names.build,
+                names.status,
+                names.dlq,
+                names.substitution,
+                names.substitution_dlq,
+            )
         ]
     )
     for future in futures.values():  # pyright: ignore[reportUnknownVariableType]
@@ -130,6 +146,8 @@ def _config(bootstrap: str, topics: Topics) -> WorkerConfig:
         build_topic=topics.build,
         status_topic=topics.status,
         build_dlq_topic=topics.dlq,
+        substitution_topic=topics.substitution,
+        substitution_dlq_topic=topics.substitution_dlq,
     )
     config.validate()
     return config
@@ -181,10 +199,11 @@ def _read(bootstrap: str, topic: str, count: int) -> list[Received]:
     return received
 
 
-def _committed_offset(bootstrap: str, topics: Topics) -> int:
+def _committed_offset(bootstrap: str, topics: Topics, topic: str | None = None) -> int:
     consumer = Consumer({"bootstrap.servers": bootstrap, "group.id": topics.group})
     try:
-        [partition] = consumer.committed([TopicPartition(topics.build, 0)], timeout=30)
+        partitions = [TopicPartition(topic or topics.build, 0)]
+        [partition] = consumer.committed(partitions, timeout=30)
         return partition.offset
     finally:
         consumer.close()
@@ -203,13 +222,19 @@ class RunningWorker:
         return self.exit_codes[0]
 
 
-def _start_worker(bootstrap: str, topics: Topics, engine: Engine) -> RunningWorker:
+def _start_worker(
+    bootstrap: str,
+    topics: Topics,
+    engine: Engine,
+    substitution: SubstitutionEngine = substitute,
+) -> RunningWorker:
     config = _config(bootstrap, topics)
     worker = Worker(
-        consumer=KafkaConsumer(config, [config.build_topic]),
+        consumer=KafkaConsumer(config, list(config.consumed_topics)),
         producer=KafkaProducer(config),
         engine=engine,
         config=config,
+        substitute=substitution,
     )
     exit_codes: list[int] = []
     thread = threading.Thread(target=lambda: exit_codes.append(worker.run()), daemon=True)
@@ -244,7 +269,9 @@ def test_started_then_completed_keyed_by_school_and_offset_committed(
 def test_real_engine_end_to_end_through_the_broker(bootstrap: str, topics: Topics) -> None:
     """The CP-SAT engine itself behind the worker: request in, full timetable out."""
     _send(bootstrap, topics.build, encode(build_request(queue_deadline_at=_future_deadline())))
-    running = _start_worker(bootstrap, topics, solve)
+    running = _start_worker(
+        bootstrap, topics, lambda pr, pa, st, prog: solve(pr, pa, st, progress=prog)
+    )
     try:
         _, completed = _read(bootstrap, topics.status, 2)
     finally:
@@ -284,9 +311,63 @@ def test_poison_message_lands_in_dlq_and_is_committed(bootstrap: str, topics: To
     finally:
         assert running.stop() == 0
 
-    assert dead.value == b"definitely not json"
+    raw = b"definitely not json"
+    assert dead.value is not None
+    assert json.loads(dead.value) == {  # never the raw bytes: they may carry personal data
+        "unparseable": True,
+        "size_bytes": len(raw),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+    }
     assert dead.headers["x-error-class"] == b"not_json"
     assert dead.headers["x-original-offset"] == b"0"
+
+
+def test_substitution_is_solved_end_to_end_through_the_broker(
+    bootstrap: str, topics: Topics
+) -> None:
+    """The stage 2 engine behind the worker: started, then completed with data.substitution."""
+    request = substitution_request(queue_deadline_at=_future_deadline())
+    _send(bootstrap, topics.substitution, encode(request))
+    engine = FakeEngine(Journal())
+    running = _start_worker(bootstrap, topics, engine)
+    try:
+        started, completed = _read(bootstrap, topics.status, 2)
+        _wait_until(
+            lambda: (
+                True if _committed_offset(bootstrap, topics, topics.substitution) == 1 else None
+            ),
+            "the commit",
+        )
+    finally:
+        assert running.stop() == 0
+
+    assert [started.json()["type"], completed.json()["type"]] == [
+        "solve.started",
+        "solve.completed",
+    ]
+    assert started.key == completed.key == SCHOOL_ID.encode()
+    data = completed.json()["data"]
+    assert data["status"] == "OPTIMAL"
+    assert data["substitution"]["proposals"][0]["teacher_id"] == "t-2"
+    assert engine.calls == []  # the build engine is not involved
+
+
+def test_broken_substitution_lands_in_its_own_dlq(bootstrap: str, topics: Topics) -> None:
+    _send(bootstrap, topics.substitution, b"definitely not json")
+    running = _start_worker(bootstrap, topics, FakeEngine(Journal()))
+    try:
+        [dead] = _read(bootstrap, topics.substitution_dlq, 1)
+        _wait_until(
+            lambda: (
+                True if _committed_offset(bootstrap, topics, topics.substitution) == 1 else None
+            ),
+            "the commit",
+        )
+    finally:
+        assert running.stop() == 0
+
+    assert dead.headers["x-original-topic"] == topics.substitution.encode()
+    assert dead.headers["x-error-class"] == b"not_json"
 
 
 _SLOW_WORKER = """
@@ -296,17 +377,37 @@ from lad_solver.adapters.kafka.config import WorkerConfig
 from lad_solver.adapters.kafka.kafka_io import KafkaConsumer, KafkaProducer
 from lad_solver.adapters.kafka.worker import Worker
 
-def never_returns(problem, params, stop):
+def never_returns(*_args):
     threading.Event().wait()
 
 jsonlog.configure()
-bootstrap, build, status, dlq, group = sys.argv[1:6]
+bootstrap, build, status, dlq, group, substitution, substitution_dlq = sys.argv[1:8]
 config = WorkerConfig(bootstrap_servers=bootstrap, group_id=group, build_topic=build,
-                      status_topic=status, build_dlq_topic=dlq)
+                      status_topic=status, build_dlq_topic=dlq, substitution_topic=substitution,
+                      substitution_dlq_topic=substitution_dlq)
 config.validate()
-worker = Worker(KafkaConsumer(config, [build]), KafkaProducer(config), never_returns, config)
+consumer = KafkaConsumer(config, list(config.consumed_topics))
+worker = Worker(consumer, KafkaProducer(config), never_returns, config, never_returns)
 sys.exit(worker.run())
 """
+
+
+def _slow_worker(bootstrap: str, topics: Topics) -> subprocess.Popen[bytes]:
+    """A worker process whose engines never return, to be killed mid-solve."""
+    args = [
+        bootstrap,
+        topics.build,
+        topics.status,
+        topics.dlq,
+        topics.group,
+        topics.substitution,
+        topics.substitution_dlq,
+    ]
+    return subprocess.Popen(  # noqa: S603 -- fixed interpreter and script
+        [sys.executable, "-c", _SLOW_WORKER, *args],
+        cwd=Path(__file__).resolve().parents[2],
+        env=os.environ.copy(),
+    )
 
 
 @pytest.mark.slow
@@ -317,12 +418,7 @@ def test_kill_9_during_solve_does_not_redeliver_the_job(bootstrap: str, topics: 
     """
     job_a = build_request(queue_deadline_at=_future_deadline())
     _send(bootstrap, topics.build, encode(job_a))
-    args = [bootstrap, topics.build, topics.status, topics.dlq, topics.group]
-    process = subprocess.Popen(  # noqa: S603 -- fixed interpreter and script
-        [sys.executable, "-c", _SLOW_WORKER, *args],
-        cwd=Path(__file__).resolve().parents[2],
-        env=os.environ.copy(),
-    )
+    process = _slow_worker(bootstrap, topics)
     try:
         [started_a] = _read(bootstrap, topics.status, 1)
         assert started_a.json()["type"] == "solve.started"
@@ -346,3 +442,64 @@ def test_kill_9_during_solve_does_not_redeliver_the_job(bootstrap: str, topics: 
         ("solve.completed", job_b["data"]["job_id"]),
     ]
     assert _committed_offset(bootstrap, topics) == 2
+
+
+@pytest.mark.slow
+def test_kill_9_during_a_substitution_fails_the_job_and_the_next_one_is_solved(
+    bootstrap: str, topics: Topics
+) -> None:
+    """testing.md: kill -9 during a calculation -> the job is ``failed``, the next one runs.
+
+    The offset is committed before the engine starts, so job A is never redelivered: its only
+    event is solve.started, and timetable's watchdog fails it after run_deadline_at (replayed
+    with the reference job machine). Job B, sent after the kill, is solved by a new worker.
+    """
+    job_a = substitution_request(queue_deadline_at=_future_deadline())
+    _send(bootstrap, topics.substitution, encode(job_a))
+    process = _slow_worker(bootstrap, topics)
+    try:
+        [started_a] = _read(bootstrap, topics.status, 1)
+        assert started_a.json()["type"] == "solve.started"
+        _wait_until(
+            lambda: (
+                True if _committed_offset(bootstrap, topics, topics.substitution) == 1 else None
+            ),
+            "A+1",
+        )
+    finally:
+        process.send_signal(signal.SIGKILL)
+        process.wait(timeout=30)
+    assert process.returncode == -signal.SIGKILL
+
+    job_b = substitution_request(queue_deadline_at=_future_deadline())
+    job_b["data"]["job_id"] = str(uuid.uuid4())
+    _send(bootstrap, topics.substitution, encode(job_b))
+    running = _start_worker(bootstrap, topics, FakeEngine(Journal()))
+    try:
+        events = [e.json() for e in _read(bootstrap, topics.status, 3)]
+    finally:
+        assert running.stop() == 0
+
+    assert [(e["type"], e["data"]["job_id"]) for e in events] == [
+        ("solve.started", job_a["data"]["job_id"]),
+        ("solve.started", job_b["data"]["job_id"]),
+        ("solve.completed", job_b["data"]["job_id"]),
+    ]
+    assert events[2]["data"]["status"] in {"OPTIMAL", "FEASIBLE"}
+    assert events[2]["data"]["substitution"]["proposals"]
+    assert _committed_offset(bootstrap, topics, topics.substitution) == 2
+    jobs = {
+        job["data"]["job_id"]: ReferenceJob(
+            queue_deadline_at=instant(job["data"]["queue_deadline_at"]),
+            time_limit_s=job["data"]["time_limit_s"],
+            margin_s=90,
+        )
+        for job in (job_a, job_b)
+    }
+    for event in events:
+        jobs[event["data"]["job_id"]].on_event(event)
+    a, b = jobs[job_a["data"]["job_id"]], jobs[job_b["data"]["job_id"]]
+    assert (a.state, b.state) == ("running", "done")
+    assert a.run_deadline_at is not None
+    assert a.on_watchdog(a.run_deadline_at + timedelta(seconds=1))
+    assert a.state == "failed"

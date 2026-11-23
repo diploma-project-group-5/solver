@@ -7,6 +7,7 @@ history. Primary classes have a homeroom teacher; specialists teach 1-2 subjects
 No personal data: every identifier is synthetic.
 """
 
+import math
 import random
 from dataclasses import dataclass
 
@@ -113,8 +114,8 @@ def generate_problem(
     saturday: bool = False,
     kind: TimetableKind = TimetableKind.MAIN,
 ) -> Problem:
-    if classes < 1 or shelter_ratio < 0:
-        msg = "classes must be >= 1 and shelter_ratio >= 0"
+    if classes < 1 or not math.isfinite(shelter_ratio) or shelter_ratio < 0:
+        msg = "classes must be >= 1 and shelter_ratio a finite number >= 0"
         raise ValueError(msg)
     rng = random.Random(seed)  # noqa: S311 - synthetic data, not cryptography
     days = (1, 2, 3, 4, 5, 6) if saturday else (1, 2, 3, 4, 5)

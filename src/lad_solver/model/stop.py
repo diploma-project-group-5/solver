@@ -9,7 +9,9 @@ their best solution.
 from typing import Protocol
 
 
-class _Stoppable(Protocol):
+class Stoppable(Protocol):
+    """What a stop needs from a running solver (``CpSolver`` or a test double)."""
+
     def stop_search(self) -> None: ...
 
 
@@ -18,7 +20,7 @@ class StopHandle:
 
     def __init__(self) -> None:
         self._stopped = False
-        self._current: _Stoppable | None = None
+        self._current: Stoppable | None = None
 
     @property
     def stopped(self) -> bool:
@@ -30,7 +32,7 @@ class StopHandle:
         if current is not None:
             current.stop_search()
 
-    def attach(self, solver: _Stoppable) -> None:
+    def attach(self, solver: Stoppable) -> None:
         """Register the solver about to run; stops it at once if a stop was already requested."""
         self._current = solver
         if self._stopped:

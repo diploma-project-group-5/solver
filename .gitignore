@@ -26,3 +26,4 @@ htmlcov/
 
 # CI checkout of the contracts repo
 _contracts/
+_validator/

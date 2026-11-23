@@ -1,12 +1,12 @@
 """Hand fixtures with OPTIMAL objective values (ADR 2026-11-04 §5, testing.md capacity cases).
 
 Assertions are on objective values and formats, not on exact grids; every solved result also
-passes the independent oracle.
+passes the validator-lib CLI.
 """
 
 import pytest
 
-import oracle
+import golden
 from builders import OTHER, OUTSIDE, PRIO, klass, problem, row, teacher
 from lad_solver.app.solve import solve
 from lad_solver.domain.problem import AlertLimits, Params, Passport, Problem, TimetableKind
@@ -19,8 +19,8 @@ ALERT = TimetableKind.ALERT
 def _solve(p: Problem) -> Result:
     result = solve(p, PARAMS)
     assert result.status is SolveStatus.OPTIMAL
-    assert oracle.violations(p, result) == []
-    recomputed = oracle.objective(p, result)
+    assert golden.violations(p, result) == []
+    recomputed = golden.objective(p, result)
     assert result.stats.objective == recomputed.value
     assert (result.stats.primary, result.stats.secondary) == (
         recomputed.primary,
@@ -28,10 +28,6 @@ def _solve(p: Problem) -> Result:
     )
     assert result.stats.stop_reason is StopReason.COMPLETED
     return result
-
-
-def _in_person(result: Result) -> set[tuple[str, int]]:
-    return {(f.class_id, f.day) for f in result.day_formats if f.in_person}
 
 
 def _one_class(
@@ -72,6 +68,34 @@ def test_model_1_1_vs_1_2_differ_by_seats() -> None:
     assert _solve(_one_class(AlertLimits(19, 1000), ALERT)).stats.objective == 0
 
 
+@pytest.mark.parametrize(
+    ("capacity", "kind"),
+    [
+        (Passport(2**64), TimetableKind.MAIN),
+        (AlertLimits(seats=2**63, passport=2**64), ALERT),
+    ],
+    ids=["1.1", "1.2"],
+)
+def test_capacity_beyond_int64_is_an_unlimited_shelter(
+    capacity: Passport | AlertLimits, kind: TimetableKind
+) -> None:
+    # CP-SAT takes int64 constants only: such limits must not crash the model build.
+    p = problem(
+        classes=(klass("a", 20),),
+        teachers=(teacher("t1"),),
+        rows=(row("a", PRIO, "t1", 2),),
+        capacity=capacity,
+        kind=kind,
+        days=(1,),
+        staff=2**63,
+    )
+    # Outside the contract (staff <= 100000): validator-lib rejects such a snapshot, so only the
+    # engine's robustness and objective are checked here, not the timetable rules.
+    result = solve(p, PARAMS)
+    assert result.status is SolveStatus.OPTIMAL
+    assert result.stats.objective == golden.objective(p, result).value == 40
+
+
 def test_teacher_with_several_in_person_lessons_is_counted_once() -> None:
     p = problem(
         classes=(klass("a", 20),),
@@ -93,7 +117,7 @@ def test_teacher_with_only_remote_lessons_is_not_counted() -> None:
     )
     result = _solve(p)
     assert result.stats.objective == 40
-    assert _in_person(result) == {("a", 1)}
+    assert golden.in_person_days(result) == {("a", 1)}
 
 
 @pytest.mark.parametrize(("second", "objective"), [("t1", 0), ("t2", 20)], ids=["shared", "own"])
@@ -125,7 +149,7 @@ def test_no_shelter_only_on_remote_days_and_only_for_alert(
     result = _solve(p)
     assert result.stats.objective == objective
     if kind is ALERT:
-        in_person = _in_person(result)
+        in_person = golden.in_person_days(result)
         assert all(
             (x.class_id, x.day) not in in_person for x in result.lessons if x.subject_id == OUTSIDE
         )
@@ -140,7 +164,7 @@ def test_empty_day_is_never_in_person() -> None:
     )
     result = _solve(p)
     assert result.stats.objective == 3 * 20 + 1  # one in-person day, not two
-    assert len(_in_person(result)) == 1
+    assert len(golden.in_person_days(result)) == 1
 
 
 def test_class_priority_flag_only_breaks_ties() -> None:
@@ -152,7 +176,7 @@ def test_class_priority_flag_only_breaks_ties() -> None:
         days=(1,),
     )
     result = _solve(p)
-    assert _in_person(result) == {("b", 1)}  # 21 pupils beat the flag
+    assert golden.in_person_days(result) == {("b", 1)}  # 21 pupils beat the flag
     assert result.stats.objective == 2 * 21
 
 
@@ -216,3 +240,15 @@ def test_stop_before_start_returns_unknown_without_timetable() -> None:
     result = solve(_one_class(Passport(100)), PARAMS, handle)
     assert result.status is SolveStatus.UNKNOWN
     assert result.stats.stop_reason is StopReason.STOPPED
+
+
+def test_duplicate_class_subject_row_is_model_invalid_without_solving() -> None:
+    p = problem(
+        classes=(klass("a", 10),),
+        teachers=(teacher("t1"), teacher("t2")),
+        rows=(row("a", PRIO, "t1", 2), row("a", PRIO, "t2", 1)),
+    )
+    result = solve(p, PARAMS)
+    assert result.status is SolveStatus.MODEL_INVALID
+    assert result.stats.stop_reason is StopReason.PRECHECK
+    assert result.lessons == ()

@@ -33,9 +33,7 @@ def available_days(problem: Problem, teacher: Teacher) -> tuple[int, ...]:
     return tuple(d for d in problem.school_days if d not in teacher.unavailable_days)
 
 
-def precheck(
-    problem: Problem, *, row_day_cap_min: int = DEFAULT_ROW_DAY_CAP_MIN
-) -> tuple[Conflict, ...]:
+def precheck(problem: Problem) -> tuple[Conflict, ...]:
     """Return every pre-check conflict; an empty tuple means "hand over to CP-SAT"."""
     invalid = tuple(_invalid_input(problem))
     if invalid:
@@ -44,7 +42,7 @@ def precheck(
         *_capacity(problem),
         *_class_hours(problem),
         *_teacher_hours(problem),
-        *_row_caps(problem, row_day_cap_min),
+        *_row_caps(problem),
     )
 
 
@@ -54,6 +52,7 @@ _BAD = ConflictRule.INVALID_INPUT
 def _invalid_input(problem: Problem) -> Iterator[Conflict]:
     yield from _invalid_frame(problem)
     yield from _duplicate_ids(problem)
+    yield from _duplicate_rows(problem)
     yield from _invalid_entities(problem)
     yield from _invalid_rows(problem)
 
@@ -67,6 +66,10 @@ def _invalid_frame(problem: Problem) -> Iterator[Conflict]:
     if not MIN_LESSONS_PER_DAY <= problem.lessons_per_day <= MAX_LESSONS_PER_DAY:
         yield Conflict(_BAD)
     if problem.staff < 0:
+        yield Conflict(_BAD)
+    if isinstance(problem.capacity, AlertLimits) != (problem.kind is TimetableKind.ALERT):
+        yield Conflict(_BAD)  # 1.1 takes a passport only, 1.2 seats and passport
+    if problem.capacity.passport < 0:
         yield Conflict(_BAD)
     if isinstance(problem.capacity, AlertLimits) and problem.capacity.seats < 0:
         yield Conflict(_BAD)  # zero seats are fine: every class is remote
@@ -82,6 +85,18 @@ def _duplicate_ids(problem: Problem) -> Iterator[Conflict]:
     for teacher_id, n in Counter(t.id for t in problem.teachers).items():
         if n > 1:
             yield Conflict(_BAD, teacher_id=teacher_id)
+
+
+def _duplicate_rows(problem: Problem) -> Iterator[Conflict]:
+    """One teacher per class x subject (spec, section 04; split groups are after MVP).
+
+    A second row for the pair, any teacher, is a broken snapshot (validator-lib: duplicate_row).
+    """
+    for (class_id, subject_id), n in Counter(
+        (r.class_id, r.subject_id) for r in problem.rows
+    ).items():
+        if n > 1:
+            yield Conflict(_BAD, class_id=class_id, subject_id=subject_id)
 
 
 def _invalid_entities(problem: Problem) -> Iterator[Conflict]:
@@ -143,14 +158,15 @@ def _teacher_hours(problem: Problem) -> Iterator[Conflict]:
             yield Conflict(ConflictRule.TEACHER_HOURS_EXCEED_AVAILABLE_SLOTS, teacher_id=t.id)
 
 
-def _row_caps(problem: Problem, cap_min: int) -> Iterator[Conflict]:
+def _row_caps(problem: Problem) -> Iterator[Conflict]:
     teachers = {t.id: t for t in problem.teachers}
     for r in problem.rows:
         n_days = len(available_days(problem, teachers[r.teacher_id]))
         if n_days == 0:
             continue  # reported as teacher_unavailable_all_days
-        per_day = min(row_day_cap(r.hours, n_days, cap_min), problem.lessons_per_day)
-        if r.hours > per_day * n_days:
+        # The cap rule h_r > min(row_day_cap, L) * n at its binding point: row_day_cap is at
+        # least ceil(h_r / n), so only L can bind (for any row_day_cap_min).
+        if r.hours > problem.lessons_per_day * n_days:
             yield Conflict(
                 ConflictRule.ROW_DAY_CAP,
                 class_id=r.class_id,

@@ -1,11 +1,31 @@
 """Composition root: a Kafka client that cannot be built fails with a log line, not a traceback."""
 
 import json
+import signal
 
 import pytest
 from confluent_kafka import KafkaException
+from kafka_support import build_request, encode, harness, substitution_request
 
 from lad_solver.adapters.kafka import main as worker_main
+from lad_solver.adapters.kafka.mapping import (
+    Accepted,
+    SubstitutionAccepted,
+    parse_build_request,
+    parse_substitution_request,
+)
+from lad_solver.domain.problem import Params, Problem
+from lad_solver.domain.result import Result, SolveStatus
+from lad_solver.domain.substitution import (
+    Proposal,
+    ProposalKind,
+    SubstitutionParams,
+    SubstitutionRequest,
+    SubstitutionResult,
+    SubstitutionStats,
+)
+from lad_solver.model.progress import Progress
+from lad_solver.model.stop import StopHandle
 
 ENV = {"KAFKA_BOOTSTRAP_SERVERS": "kafka:9092"}
 
@@ -51,3 +71,113 @@ def test_producer_init_failure_closes_the_consumer(
 
     assert consumers[0].closed
     assert "kafka.init_failed" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGINT])
+def test_signal_handlers_request_a_stop(
+    signum: signal.Signals, capsys: pytest.CaptureFixture[str]
+) -> None:
+    h = harness()
+    h.consumer.on_idle = None  # only the signal may stop the worker
+    saved = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGINT)}
+    try:
+        worker_main.install_signal_handlers(h.worker)
+        signal.raise_signal(signum)
+    finally:
+        for s, handler in saved.items():
+            signal.signal(s, handler)
+
+    assert h.worker.stop_requested
+    assert h.worker.run() == 0
+    lines = [json.loads(x) for x in capsys.readouterr().out.splitlines()]
+    stopping = [x for x in lines if x["msg"] == "worker.stopping"]
+    assert [x["signal"] for x in stopping] == [signum.name]
+
+
+def test_production_engine_passes_stop_and_progress_to_solve(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[Problem, Params, StopHandle | None, Progress | None]] = []
+
+    def fake_solve(
+        problem: Problem,
+        params: Params,
+        stop: StopHandle | None = None,
+        *,
+        progress: Progress | None = None,
+    ) -> Result:
+        calls.append((problem, params, stop, progress))
+        return Result(status=SolveStatus.UNKNOWN)
+
+    monkeypatch.setattr(worker_main, "solve", fake_solve)
+    outcome = parse_build_request(encode(build_request()))
+    assert isinstance(outcome, Accepted)
+    params, stop, progress = Params(time_limit_s=10.0), StopHandle(), Progress()
+
+    result = worker_main._engine(outcome.problem, params, stop, progress)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+    assert result.status is SolveStatus.UNKNOWN
+    assert calls == [(outcome.problem, params, stop, progress)]
+
+
+def test_production_substitution_engine_passes_the_stop_to_substitute(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[SubstitutionRequest, SubstitutionParams, StopHandle | None]] = []
+    outcome = parse_substitution_request(encode(substitution_request()))
+    assert isinstance(outcome, SubstitutionAccepted)
+    [slot] = outcome.request.lessons
+    self_study = Proposal(slot, ProposalKind.SELF_STUDY, 2)
+    answer = SubstitutionResult(SolveStatus.FEASIBLE, (self_study,), SubstitutionStats())
+
+    def fake_substitute(
+        request: SubstitutionRequest,
+        params: SubstitutionParams,
+        stop: StopHandle | None = None,
+    ) -> SubstitutionResult:
+        calls.append((request, params, stop))
+        return answer
+
+    monkeypatch.setattr(worker_main, "substitute", fake_substitute)
+    params, stop = SubstitutionParams(time_limit_s=10.0), StopHandle()
+
+    result = worker_main._substitution_engine(outcome.request, params, stop)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+    assert result is answer
+    assert calls == [(outcome.request, params, stop)]
+
+
+class _IdleWorker:
+    def __init__(self, **_kwargs: object) -> None:
+        pass
+
+    def request_stop(self, _signal_name: str = "SIGTERM") -> None:
+        pass
+
+    def run(self) -> int:
+        return 0
+
+
+def test_worker_subscribes_to_build_and_substitution_topics(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    subscribed: list[list[str]] = []
+
+    def consumer(_config: object, topics: list[str]) -> _Closable:
+        subscribed.append(topics)
+        return _Closable()
+
+    monkeypatch.setattr(worker_main, "KafkaConsumer", consumer)
+    monkeypatch.setattr(worker_main, "KafkaProducer", _Closable)
+    monkeypatch.setattr(worker_main, "Worker", _IdleWorker)
+    saved = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGINT)}
+    try:
+        assert worker_main.run(ENV) == 0
+    finally:
+        for s, handler in saved.items():
+            signal.signal(s, handler)
+
+    assert subscribed == [["solve.build.requested", "solve.substitution.requested"]]
+    lines = [json.loads(x) for x in capsys.readouterr().out.splitlines()]
+    [ready] = [x for x in lines if x["msg"] == "worker.ready"]
+    assert ready["topics"] == ["solve.build.requested", "solve.substitution.requested"]

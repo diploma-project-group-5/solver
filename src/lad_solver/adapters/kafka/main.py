@@ -14,13 +14,26 @@ from lad_solver.adapters.kafka.kafka_io import KafkaConsumer, KafkaProducer
 from lad_solver.adapters.kafka.mapping import MODEL_VERSION
 from lad_solver.adapters.kafka.worker import EXIT_FAILURE, Worker
 from lad_solver.app.solve import solve
+from lad_solver.app.substitute import substitute
 from lad_solver.domain.problem import Params, Problem
 from lad_solver.domain.result import Result
+from lad_solver.domain.substitution import (
+    SubstitutionParams,
+    SubstitutionRequest,
+    SubstitutionResult,
+)
+from lad_solver.model.progress import Progress
 from lad_solver.model.stop import StopHandle
 
 
-def _engine(problem: Problem, params: Params, stop: StopHandle) -> Result:
-    return solve(problem, params, stop)
+def _engine(problem: Problem, params: Params, stop: StopHandle, progress: Progress) -> Result:
+    return solve(problem, params, stop, progress=progress)
+
+
+def _substitution_engine(
+    request: SubstitutionRequest, params: SubstitutionParams, stop: StopHandle
+) -> SubstitutionResult:
+    return substitute(request, params, stop)
 
 
 def touch(path: Path) -> None:
@@ -47,7 +60,8 @@ def run(env: Mapping[str, str] | None = None) -> int:
 
     consumer: KafkaConsumer | None = None
     try:
-        consumer = KafkaConsumer(config, [config.build_topic])  # substitutions: stage 2
+        # One group for build and substitution jobs (spec §03).
+        consumer = KafkaConsumer(config, list(config.consumed_topics))
         producer = KafkaProducer(config)
     except Exception as exc:  # noqa: BLE001 -- bad client config / librdkafka init; class only
         jsonlog.log(ERROR, "kafka.init_failed", error_class=type(exc).__name__)
@@ -59,15 +73,22 @@ def run(env: Mapping[str, str] | None = None) -> int:
         producer=producer,
         engine=_engine,
         config=config,
+        substitute=_substitution_engine,
         heartbeat=lambda: touch(config.heartbeat_file),
     )
     install_signal_handlers(worker)
     jsonlog.log(
         INFO,
         "worker.ready",
-        topic=config.build_topic,
+        topics=list(config.consumed_topics),
+        group_id=config.group_id,
         solver_version=__version__,
         model_version=MODEL_VERSION,
+        num_workers=config.num_workers,
+        time_limit_s=[config.min_time_limit_s, config.max_time_limit_s],
+        max_memory_mb=config.max_memory_mb,
+        stall_min_s=config.stall_min_s or None,  # None: the no-improvement stop is off
+        stall_ratio=config.stall_ratio,
     )
     code = worker.run()
     jsonlog.log(INFO, "worker.exited", status=code)
