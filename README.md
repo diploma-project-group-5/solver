@@ -102,7 +102,9 @@ substitution.
 
 ## Development
 
-Requires [uv](https://docs.astral.sh/uv/) (it installs Python 3.14 itself).
+Requires [uv](https://docs.astral.sh/uv/) (it installs Python 3.14 itself). `.python-version` pins the
+patch release: on Python 3.14.5 and 3.14.6 `json.loads` raises `RecursionError` on deeply nested
+documents, which turns a valid job with a deeply nested unknown field into poison.
 
 ```bash
 uv sync                      # create .venv from uv.lock
